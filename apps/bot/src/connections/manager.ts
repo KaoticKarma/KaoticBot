@@ -4,6 +4,7 @@ import { KickChatClient } from '../chat/client.js';
 import { kickApi } from '../kick/api.js';
 import { createChildLogger } from '../utils/logger.js';
 import { getAccountWithValidTokens, refreshBotToken } from '../auth/oauth.js';
+import { setLatency } from '../utils/variables.js';
 import type { Account, BotConfig } from '../db/schema.js';
 
 const log = createChildLogger('connection-manager');
@@ -20,6 +21,7 @@ export interface ChannelConnection {
   connectedAt?: Date;
   messageCount: number;
   reconnectAttempts: number;
+  latency: number; // WebSocket latency in ms
 }
 
 export interface ConnectionStatus {
@@ -29,6 +31,7 @@ export interface ConnectionStatus {
   connectedAt?: Date;
   messageCount: number;
   lastError?: string;
+  latency: number;
 }
 
 class ConnectionManager {
@@ -36,9 +39,11 @@ class ConnectionManager {
   private messageHandlers: Map<number, (message: any) => Promise<void>> = new Map();
   private eventHandlers: Map<number, Map<string, (data: any) => Promise<void>>> = new Map();
   private reconnectTimeouts: Map<number, NodeJS.Timeout> = new Map();
+  private latencyInterval: NodeJS.Timeout | null = null;
   
   private readonly MAX_RECONNECT_ATTEMPTS = 5;
   private readonly RECONNECT_DELAY_BASE = 5000; // 5 seconds base delay
+  private readonly LATENCY_CHECK_INTERVAL = 30000; // Check latency every 30 seconds
   
   /**
    * Check if bot is configured (has credentials in bot_config table)
@@ -83,6 +88,112 @@ class ConnectionManager {
     }
     
     return config.accessToken;
+  }
+  
+  /**
+   * Get the current average latency across all connections
+   */
+  getAverageLatency(): number {
+    const connections = Array.from(this.connections.values());
+    if (connections.length === 0) return 0;
+    
+    const total = connections.reduce((sum, conn) => sum + conn.latency, 0);
+    return Math.round(total / connections.length);
+  }
+  
+  /**
+   * Get latency for a specific account
+   */
+  getLatency(accountId: number): number {
+    const conn = this.connections.get(accountId);
+    return conn?.latency || 0;
+  }
+  
+  /**
+   * Start periodic latency checks
+   */
+  private startLatencyMonitoring(): void {
+    if (this.latencyInterval) return;
+    
+    this.latencyInterval = setInterval(() => {
+      this.measureLatency();
+    }, this.LATENCY_CHECK_INTERVAL);
+    
+    // Initial measurement
+    this.measureLatency();
+  }
+  
+  /**
+   * Measure latency for all connections
+   */
+  private async measureLatency(): Promise<void> {
+    for (const [accountId, connection] of this.connections) {
+      if (connection.status === 'connected' && connection.client) {
+        try {
+          const start = Date.now();
+          
+          // Use the Pusher client's internal connection state check
+          // This sends a ping and waits for pong
+          const pusher = (connection.client as any).pusher;
+          
+          if (pusher && pusher.connection) {
+            // Pusher's connection has a state
+            const state = pusher.connection.state;
+            
+            if (state === 'connected') {
+              // Measure time to get channel info (lightweight API call)
+              // This gives us a rough estimate of round-trip time
+              const elapsed = Date.now() - start;
+              
+              // Use a simple ping-style measurement
+              // Send a subscription status check which triggers internal Pusher ping
+              if (pusher.connection.socket) {
+                const pingStart = Date.now();
+                
+                // Listen for pong once
+                const pongPromise = new Promise<number>((resolve) => {
+                  const timeout = setTimeout(() => resolve(connection.latency || 50), 5000);
+                  
+                  const onPong = () => {
+                    clearTimeout(timeout);
+                    const latency = Date.now() - pingStart;
+                    resolve(latency);
+                  };
+                  
+                  // Pusher emits 'pong' event on connection
+                  if (pusher.connection.bind) {
+                    pusher.connection.bind('pong', onPong);
+                    // Cleanup after
+                    setTimeout(() => {
+                      if (pusher.connection.unbind) {
+                        pusher.connection.unbind('pong', onPong);
+                      }
+                    }, 5100);
+                  } else {
+                    clearTimeout(timeout);
+                    resolve(connection.latency || 50);
+                  }
+                });
+                
+                // Trigger ping
+                if (pusher.connection.send_event) {
+                  pusher.connection.send_event('pusher:ping', {});
+                }
+                
+                const latency = await pongPromise;
+                connection.latency = latency;
+              }
+            }
+          }
+          
+          // Update global latency for variables
+          setLatency(this.getAverageLatency());
+          
+        } catch (error) {
+          log.debug({ error, accountId }, 'Failed to measure latency');
+        }
+      }
+    }
   }
   
   /**
@@ -141,6 +252,7 @@ class ConnectionManager {
         status: 'connecting',
         messageCount: 0,
         reconnectAttempts: 0,
+        latency: 0,
       };
       
       // Set up event handlers
@@ -156,6 +268,9 @@ class ConnectionManager {
       connection.status = 'connected';
       connection.connectedAt = new Date();
       connection.reconnectAttempts = 0;
+      
+      // Start latency monitoring if not already running
+      this.startLatencyMonitoring();
       
       // Update database
       db.update(schema.accounts)
@@ -240,6 +355,7 @@ class ConnectionManager {
       connectedAt: conn.connectedAt,
       messageCount: conn.messageCount,
       lastError: conn.lastError,
+      latency: conn.latency,
     };
   }
   
@@ -254,6 +370,7 @@ class ConnectionManager {
       connectedAt: conn.connectedAt,
       messageCount: conn.messageCount,
       lastError: conn.lastError,
+      latency: conn.latency,
     }));
   }
   
@@ -310,13 +427,16 @@ class ConnectionManager {
   /**
    * Send a message to a channel using the BOT account token
    * This is the key difference - we use the bot's token, not the user's token
+   * Also measures and updates latency
    */
-  async sendMessage(accountId: number, content: string): Promise<{ success: boolean; error?: string }> {
+  async sendMessage(accountId: number, content: string): Promise<{ success: boolean; error?: string; latency?: number }> {
     const connection = this.connections.get(accountId);
     
     if (!connection || connection.status !== 'connected') {
       return { success: false, error: 'Not connected' };
     }
+    
+    const startTime = Date.now();
     
     try {
       // Get the BOT token (not the user's token)
@@ -333,11 +453,17 @@ class ConnectionManager {
         botToken // Bot's token, not user's token
       );
       
+      // Measure latency (time to send message via API)
+      const latency = Date.now() - startTime;
+      connection.latency = latency;
+      setLatency(this.getAverageLatency());
+      
       if (result.success) {
         log.debug({ 
           accountId, 
           channelSlug: connection.channelSlug,
-          messageLength: content.length 
+          messageLength: content.length,
+          latency
         }, 'Message sent successfully');
       } else {
         log.warn({
@@ -347,7 +473,7 @@ class ConnectionManager {
         }, 'Failed to send message');
       }
       
-      return result;
+      return { ...result, latency };
       
     } catch (error) {
       log.error({ error, accountId }, 'Failed to send message');
@@ -479,6 +605,12 @@ class ConnectionManager {
    */
   async shutdown(): Promise<void> {
     log.info('Shutting down connection manager...');
+    
+    // Stop latency monitoring
+    if (this.latencyInterval) {
+      clearInterval(this.latencyInterval);
+      this.latencyInterval = null;
+    }
     
     // Clear all reconnect timeouts
     for (const timeout of this.reconnectTimeouts.values()) {

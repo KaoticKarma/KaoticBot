@@ -8,6 +8,17 @@ const log = createChildLogger('variables');
 // Registry of all available variables
 const variables: Map<string, VariableFunction> = new Map();
 
+// Store latency value (set by connection manager)
+let currentLatency = 0;
+
+export function setLatency(ms: number): void {
+  currentLatency = ms;
+}
+
+export function getLatency(): number {
+  return currentLatency;
+}
+
 // Register a variable handler
 export function registerVariable(name: string, handler: VariableFunction): void {
   variables.set(name.toLowerCase(), handler);
@@ -110,13 +121,24 @@ function parseVariableParts(inner: string): string[] {
 // Built-in Variable Handlers
 // ============================================
 
-// User variables
-registerVariable('user', (ctx) => ctx.user.displayName);
+// User variables - $(user) now includes @ for tagging
+registerVariable('user', (ctx) => `@${ctx.user.displayName}`);
 registerVariable('username', (ctx) => ctx.user.username);
 registerVariable('userid', (ctx) => ctx.user.id.toString());
 
+// User without @ prefix (if someone wants it without tagging)
+registerVariable('name', (ctx) => ctx.user.displayName);
+
 // Target user (for commands like !hug @someone)
-registerVariable('touser', (ctx) => ctx.touser || ctx.user.displayName);
+registerVariable('touser', (ctx) => {
+  if (ctx.touser) {
+    // Ensure @ prefix
+    const name = ctx.touser.replace(/^@/, '');
+    return `@${name}`;
+  }
+  return `@${ctx.user.displayName}`;
+});
+
 registerVariable('toname', (ctx) => {
   if (ctx.touser) {
     // Remove @ if present and return lowercase
@@ -125,17 +147,19 @@ registerVariable('toname', (ctx) => {
   return ctx.user.username;
 });
 
-// Random user from chat
+// Random user from chat (with @ prefix)
 registerVariable('randomuser', (ctx) => {
   if (ctx.chatUsers.length === 0) {
-    return ctx.user.displayName;
+    return `@${ctx.user.displayName}`;
   }
   // Filter out the command sender for more interesting results
   const others = ctx.chatUsers.filter(u => u.toLowerCase() !== ctx.user.username.toLowerCase());
   if (others.length === 0) {
-    return ctx.chatUsers[Math.floor(Math.random() * ctx.chatUsers.length)];
+    const randomUser = ctx.chatUsers[Math.floor(Math.random() * ctx.chatUsers.length)];
+    return `@${randomUser}`;
   }
-  return others[Math.floor(Math.random() * others.length)];
+  const randomUser = others[Math.floor(Math.random() * others.length)];
+  return `@${randomUser}`;
 });
 
 // Channel info
@@ -243,8 +267,8 @@ registerVariable('date', () => {
   });
 });
 
-// Latency placeholder (will be replaced by command handler with actual value)
-registerVariable('latency', () => '0');
+// Latency - returns the current WebSocket latency in ms
+registerVariable('latency', () => `${currentLatency}ms`);
 
 // Followage placeholder (requires API call - will be implemented in command handler)
 registerVariable('followage', () => 'Unknown');
