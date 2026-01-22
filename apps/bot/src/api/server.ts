@@ -14,12 +14,12 @@ import { createChildLogger } from '../utils/logger.js';
 import { alertsManager } from '../alerts/manager.js';
 import { initializeTracker } from '../stats/tracker.js';
 import { connectionManager } from '../connections/manager.js';
+import { firstTimeChatService } from '../features/first-time-chat.js';
 import { isDiscordReady, testDiscordConnection, getBotGuilds, getGuildChannels, getGuildRoles, getBotInviteUrl } from '../discord/service.js';
 import { readFileSync, createWriteStream, existsSync, mkdirSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { pipeline } from 'stream/promises';
-import { registerStatisticsRoutes } from './statistics.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -678,6 +678,50 @@ export async function startServer() {
     return db.select().from(schema.eventMessages).where(eq(schema.eventMessages.id, parseInt(id, 10))).get();
   });
 
+  // ============================================
+  // First Time Chatter API
+  // ============================================
+
+  app.get('/api/first-time-chat/settings', { preHandler: requireAuth }, async (request) => {
+    const { account } = request as AuthenticatedRequest;
+    return firstTimeChatService.getSettings(account.id);
+  });
+
+  app.patch('/api/first-time-chat/settings', { preHandler: requireAuth }, async (request) => {
+    const { account } = request as AuthenticatedRequest;
+    const body = request.body as { enabled?: boolean; message?: string };
+    return await firstTimeChatService.updateSettings(account.id, body);
+  });
+
+  app.post('/api/first-time-chat/test', { preHandler: requireAuth }, async (request, reply) => {
+    const { account } = request as AuthenticatedRequest;
+    const settings = firstTimeChatService.getSettings(account.id);
+    
+    if (!settings.enabled) {
+      return reply.code(400).send({ error: 'First time chat is disabled' });
+    }
+    
+    // Build test message
+    let message = settings.message;
+    message = message.replace(/\$\(user\)/gi, '@TestNewViewer');
+    message = message.replace(/\$\(name\)/gi, 'TestNewViewer');
+    
+    const result = await connectionManager.sendMessage(account.id, message);
+    
+    if (result.success) {
+      return { success: true };
+    } else {
+      return reply.code(500).send({ error: result.error || 'Failed to send test message' });
+    }
+  });
+
+  app.post('/api/first-time-chat/reset-cache', { preHandler: requireAuth }, async (request) => {
+    const { account } = request as AuthenticatedRequest;
+    const countBefore = firstTimeChatService.getKnownChatterCount(account.id);
+    firstTimeChatService.resetCache(account.id);
+    return { success: true, message: `Cleared ${countBefore} known chatters - everyone will be welcomed again` };
+  });
+
   // Moderation API
   app.get('/api/moderation/settings', { preHandler: requireAuth }, async (request) => {
     const { account } = request as AuthenticatedRequest;
@@ -929,11 +973,6 @@ export async function startServer() {
     
     return { success: true };
   });
-
-  // ============================================
-  // Statistics API
-  // ============================================
-  await registerStatisticsRoutes(app);
 
   // Root
   app.get('/', async (request) => {

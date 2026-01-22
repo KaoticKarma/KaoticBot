@@ -4,14 +4,14 @@ import { createChildLogger } from '../utils/logger.js';
 
 const log = createChildLogger('first-time-chatter');
 
-// In-memory cache of known chatters per account (for performance)
-// Map<accountId, Set<oderId>>
-const knownChatters = new Map<number, Set<number>>();
+// In-memory cache for fast lookups (loaded from DB on init)
+// Map<accountId, Set<kickUserId>>
+const knownChattersCache = new Map<number, Set<number>>();
 
 // Settings per account
 interface FirstTimeChatSettings {
   enabled: boolean;
-  message: string; // Supports $(user) variable
+  message: string;
 }
 
 const defaultSettings: FirstTimeChatSettings = {
@@ -22,35 +22,33 @@ const defaultSettings: FirstTimeChatSettings = {
 class FirstTimeChatService {
   
   /**
-   * Initialize cache for an account from existing users
+   * Initialize cache for an account from database
    */
   async initializeAccount(accountId: number): Promise<void> {
-    if (knownChatters.has(accountId)) return;
+    if (knownChattersCache.has(accountId)) return;
     
-    // Load existing users from database
-    const users = db.select({ oderId: schema.users.oderId })
-      .from(schema.users)
-      .where(eq(schema.users.accountId, accountId))
+    // Load existing known chatters from database
+    const chatters = db.select({ kickUserId: schema.knownChatters.kickUserId })
+      .from(schema.knownChatters)
+      .where(eq(schema.knownChatters.accountId, accountId))
       .all();
     
     const userSet = new Set<number>();
-    for (const user of users) {
-      if (user.oderId) {
-        userSet.add(user.oderId);
-      }
+    for (const chatter of chatters) {
+      userSet.add(chatter.kickUserId);
     }
     
-    knownChatters.set(accountId, userSet);
-    log.info({ accountId, knownCount: userSet.size }, 'Initialized first-time chatter cache');
+    knownChattersCache.set(accountId, userSet);
+    log.info({ accountId, knownCount: userSet.size }, 'Initialized first-time chatter cache from database');
   }
   
   /**
-   * Check if this is a user's first time chatting
+   * Check if this is a user's first time chatting EVER in this channel
    * Returns the welcome message if first time, null otherwise
    */
   async checkFirstTimeChatter(
     accountId: number,
-    oderId: number,
+    kickUserId: number,
     username: string
   ): Promise<string | null> {
     // Get settings
@@ -60,21 +58,31 @@ class FirstTimeChatService {
     }
     
     // Initialize cache if needed
-    if (!knownChatters.has(accountId)) {
+    if (!knownChattersCache.has(accountId)) {
       await this.initializeAccount(accountId);
     }
     
-    const known = knownChatters.get(accountId)!;
+    const known = knownChattersCache.get(accountId)!;
     
     // Check if user is already known
-    if (known.has(oderId)) {
+    if (known.has(kickUserId)) {
       return null;
     }
     
-    // First time! Add to cache
-    known.add(oderId);
+    // First time ever! Add to cache and database
+    known.add(kickUserId);
     
-    log.info({ accountId, oderId, username }, '🆕 First time chatter detected!');
+    // Insert into database for persistence
+    try {
+      db.insert(schema.knownChatters)
+        .values({ accountId, kickUserId })
+        .run();
+    } catch (error) {
+      // Might fail on duplicate if race condition, that's fine
+      log.debug({ accountId, kickUserId, error }, 'Insert known chatter (may be duplicate)');
+    }
+    
+    log.info({ accountId, kickUserId, username }, '🆕 First time chatter detected!');
     
     // Build welcome message
     let message = settings.message;
@@ -90,16 +98,12 @@ class FirstTimeChatService {
   getSettings(accountId: number): FirstTimeChatSettings {
     const row = db.select()
       .from(schema.settings)
-      .where(
-        and(
-          eq(schema.settings.key, `first_time_chat_${accountId}`)
-        )
-      )
+      .where(eq(schema.settings.key, `first_time_chat_${accountId}`))
       .get();
     
     if (row?.value) {
       try {
-        return { ...defaultSettings, ...JSON.parse(row.value) };
+        return { ...defaultSettings, ...JSON.parse(row.value as string) };
       } catch {
         return defaultSettings;
       }
@@ -139,11 +143,30 @@ class FirstTimeChatService {
   }
   
   /**
-   * Reset cache for an account (useful for testing)
+   * Reset all known chatters for an account (clears DB and cache)
+   * Use with caution - everyone will be welcomed again!
    */
   resetCache(accountId: number): void {
-    knownChatters.delete(accountId);
-    log.info({ accountId }, 'First time chatter cache reset');
+    // Clear from database
+    db.delete(schema.knownChatters)
+      .where(eq(schema.knownChatters.accountId, accountId))
+      .run();
+    
+    // Clear from cache
+    knownChattersCache.set(accountId, new Set());
+    
+    log.info({ accountId }, 'First time chatter data reset - all chatters cleared');
+  }
+  
+  /**
+   * Get count of known chatters for an account
+   */
+  getKnownChatterCount(accountId: number): number {
+    const result = db.select({ kickUserId: schema.knownChatters.kickUserId })
+      .from(schema.knownChatters)
+      .where(eq(schema.knownChatters.accountId, accountId))
+      .all();
+    return result.length;
   }
 }
 

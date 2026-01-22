@@ -11,6 +11,11 @@ interface EventMessage {
   updatedAt: string;
 }
 
+interface FirstTimeChatSettings {
+  enabled: boolean;
+  message: string;
+}
+
 const EVENT_INFO: Record<string, { icon: string; title: string; description: string; variables: string[] }> = {
   follow: {
     icon: '💚',
@@ -50,9 +55,17 @@ export default function Events() {
   const [saving, setSaving] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [testingEvent, setTestingEvent] = useState<string | null>(null);
+  
+  // First Time Chatter state
+  const [firstTimeChat, setFirstTimeChat] = useState<FirstTimeChatSettings>({
+    enabled: false,
+    message: 'Welcome to the stream, $(user)! Enjoy your stay 💚',
+  });
+  const [savingFirstTime, setSavingFirstTime] = useState(false);
 
   useEffect(() => {
     loadEvents();
+    loadFirstTimeChatSettings();
   }, []);
 
   const loadEvents = async () => {
@@ -68,6 +81,41 @@ export default function Events() {
       console.error(err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const loadFirstTimeChatSettings = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/first-time-chat/settings`);
+      if (res.ok) {
+        const data = await res.json();
+        setFirstTimeChat(data);
+      }
+    } catch (err) {
+      console.error('Failed to load first time chat settings:', err);
+    }
+  };
+
+  const updateFirstTimeChatSettings = async (updates: Partial<FirstTimeChatSettings>) => {
+    setSavingFirstTime(true);
+    try {
+      const res = await fetch(`${API_BASE}/first-time-chat/settings`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates),
+      });
+      
+      if (res.ok) {
+        const updated = await res.json();
+        setFirstTimeChat(updated);
+      } else {
+        throw new Error('Failed to update');
+      }
+    } catch (err) {
+      setError('Failed to update first time chatter settings');
+      console.error(err);
+    } finally {
+      setSavingFirstTime(false);
     }
   };
 
@@ -114,6 +162,24 @@ export default function Events() {
     }
   };
 
+  const testFirstTimeChat = async () => {
+    setTestingEvent('first_time_chat');
+    try {
+      const res = await fetch(`${API_BASE}/first-time-chat/test`, {
+        method: 'POST',
+      });
+      
+      if (!res.ok) {
+        throw new Error('Failed to send test');
+      }
+    } catch (err) {
+      setError('Failed to send test message');
+      console.error(err);
+    } finally {
+      setTimeout(() => setTestingEvent(null), 1000);
+    }
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -139,6 +205,102 @@ export default function Events() {
           <button onClick={() => setError(null)} className="ml-4 text-red-300">✕</button>
         </div>
       )}
+
+      {/* First Time Chatter Section */}
+      <div className={`bg-gray-800 rounded-lg border ${firstTimeChat.enabled ? 'border-[#53fc18]/30' : 'border-gray-700'} overflow-hidden`}>
+        {/* Header */}
+        <div className="flex items-center justify-between px-4 py-3 bg-gray-900/50">
+          <div className="flex items-center gap-3">
+            <span className="text-2xl">🆕</span>
+            <div>
+              <h3 className="text-lg font-medium text-white">First Time Chatter</h3>
+              <p className="text-gray-400 text-sm">Welcome message for new chatters</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={testFirstTimeChat}
+              disabled={!firstTimeChat.enabled || testingEvent === 'first_time_chat'}
+              className="px-3 py-1 text-sm bg-gray-700 hover:bg-gray-600 rounded disabled:opacity-50"
+            >
+              {testingEvent === 'first_time_chat' ? '✓ Sent' : '🧪 Test'}
+            </button>
+            <button
+              onClick={() => updateFirstTimeChatSettings({ enabled: !firstTimeChat.enabled })}
+              disabled={savingFirstTime}
+              className={`w-12 h-6 rounded-full relative transition-colors ${
+                firstTimeChat.enabled ? 'bg-[#53fc18]' : 'bg-gray-600'
+              }`}
+            >
+              <span
+                className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-transform ${
+                  firstTimeChat.enabled ? 'left-7' : 'left-1'
+                }`}
+              />
+            </button>
+          </div>
+        </div>
+
+        {/* Message Editor */}
+        {firstTimeChat.enabled && (
+          <div className="px-4 py-4 border-t border-gray-700 space-y-3">
+            <div>
+              <label className="block text-sm text-gray-400 mb-1">Welcome Message</label>
+              <textarea
+                value={firstTimeChat.message}
+                onChange={(e) => setFirstTimeChat({ ...firstTimeChat, message: e.target.value })}
+                onBlur={(e) => updateFirstTimeChatSettings({ message: e.target.value })}
+                rows={2}
+                className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white resize-none"
+                placeholder="Enter welcome message for first-time chatters..."
+              />
+            </div>
+            
+            {/* Variables */}
+            <div className="flex items-center gap-2 text-sm">
+              <span className="text-gray-500">Variables:</span>
+              <code
+                className="px-2 py-0.5 bg-gray-700 rounded text-[#53fc18] cursor-pointer hover:bg-gray-600"
+                onClick={() => {
+                  setFirstTimeChat({
+                    ...firstTimeChat,
+                    message: firstTimeChat.message + '$(user)',
+                  });
+                }}
+                title="Click to insert"
+              >
+                $(user)
+              </code>
+            </div>
+
+            {/* Preview */}
+            <div className="bg-gray-900 rounded p-3">
+              <span className="text-gray-500 text-xs block mb-1">Preview:</span>
+              <span className="text-white">
+                {firstTimeChat.message
+                  .replace(/\$\(user\)/gi, '@NewViewer')
+                  .replace(/\$\(name\)/gi, 'NewViewer')}
+              </span>
+            </div>
+
+            {/* Info */}
+            <div className="bg-blue-500/10 border border-blue-500/30 rounded p-3 text-sm text-blue-300">
+              💡 This message is sent when someone chats for the <strong>first time ever</strong> in your channel. 
+              The bot remembers who has chatted before.
+            </div>
+          </div>
+        )}
+
+        {/* Saving indicator */}
+        {savingFirstTime && (
+          <div className="px-4 py-2 bg-[#53fc18]/10 text-[#53fc18] text-sm">
+            Saving...
+          </div>
+        )}
+      </div>
+
+      {/* Divider */}
+      <div className="border-t border-gray-700 my-4"></div>
 
       <div className="space-y-4">
         {Object.entries(EVENT_INFO).map(([type, info]) => {
@@ -258,7 +420,7 @@ export default function Events() {
       <div className="bg-gray-800/50 rounded-lg p-4 border border-gray-700">
         <h3 className="text-white font-medium mb-2">💡 Tips</h3>
         <ul className="text-gray-400 text-sm space-y-1">
-          <li>• <code className="text-[#53fc18]">$(user)</code> = username. Add <code className="text-white">@</code> before it to mention: <code className="text-white">@$(user)</code></li>
+          <li>• <code className="text-[#53fc18]">$(user)</code> = @username (with mention)</li>
           <li>• Use <code className="text-[#53fc18]">$(amount)</code> for gift count, raid viewers, or Kick amount</li>
           <li>• Messages are sent to chat when the event happens (separate from OBS alerts)</li>
           <li>• Click "Test" to send a sample message to chat</li>

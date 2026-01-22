@@ -268,6 +268,21 @@ export const counters = sqliteTable('counters', {
 }));
 
 // ============================================
+// FIRST-TIME CHATTER TRACKING
+// ============================================
+
+// Tracks users who have chatted in a channel (for first-time chatter alerts)
+export const knownChatters = sqliteTable('known_chatters', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  accountId: integer('account_id').notNull().references(() => accounts.id, { onDelete: 'cascade' }),
+  kickUserId: integer('kick_user_id').notNull(),
+  firstChatAt: integer('first_chat_at', { mode: 'timestamp' }).notNull().$defaultFn(() => new Date()),
+}, (table) => ({
+  // Unique constraint: one entry per user per account
+  accountUserIdx: index('idx_known_chatters_account_user').on(table.accountId, table.kickUserId),
+}));
+
+// ============================================
 // CLIP SYSTEM
 // ============================================
 
@@ -471,3 +486,5 @@ export type ClipSettings = typeof clipSettings.$inferSelect;
 export type NewClipSettings = typeof clipSettings.$inferInsert;
 export type Clip = typeof clips.$inferSelect;
 export type NewClip = typeof clips.$inferInsert;
+export type KnownChatter = typeof knownChatters.$inferSelect;
+export type NewKnownChatter = typeof knownChatters.$inferInsert;
