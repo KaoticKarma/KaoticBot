@@ -10,13 +10,13 @@ import { pointsService } from './points/service.js';
 import { moderationService, type UserContext, type UserLevel } from './moderation/service.js';
 import { eventMessagesService } from './events/service.js';
 import { initializeDiscordBot, shutdownDiscordBot } from './discord/service.js';
+import { onStreamLive, onStreamOffline, onChatMessage, onNewFollower, onNewSub, onGiftedSub } from './stats/tracker.js';
 import { createChildLogger } from './utils/logger.js';
 import { eq } from 'drizzle-orm';
 import type { KickChatMessage, KickChannel } from '@kaoticbot/shared';
 
 const log = createChildLogger('main');
 
-// Timer managers per account
 const timerManagers = new Map<number, TimerManager>();
 
 class KaoticBot {
@@ -25,13 +25,9 @@ class KaoticBot {
   async start(): Promise<void> {
     log.info('Starting KaoticBot...');
     
-    // Initialize database
     await initDatabase();
-    
-    // Set database on kickApi for legacy token support
     kickApi.setDb(db, schema);
     
-    // Initialize Discord bot
     if (config.DISCORD_BOT_TOKEN) {
       log.info('Initializing Discord bot...');
       const discordReady = await initializeDiscordBot();
@@ -44,42 +40,27 @@ class KaoticBot {
       log.info('Discord bot token not configured - Discord integration disabled');
     }
     
-    // Start API server
     await startServer();
-    
-    // Connect bot instance and connection manager to server
     setBotInstance(this);
     setConnectionManager(connectionManager);
     
-    // Initialize services (lightweight - no DB calls)
     await moderationService.initialize();
     await eventMessagesService.initialize();
-    
-    // Reconnect all enabled bots
     await connectionManager.reconnectAll();
-    
-    // Start timer managers for connected accounts
     this.startTimerManagers();
     
     this.isRunning = true;
     log.info('KaoticBot is now running!');
   }
   
-  /**
-   * Set up handlers for a specific account connection
-   */
   setupAccountHandlers(accountId: number): void {
-    const account = db.select()
-      .from(schema.accounts)
-      .where(eq(schema.accounts.id, accountId))
-      .get();
+    const account = db.select().from(schema.accounts).where(eq(schema.accounts.id, accountId)).get();
     
     if (!account) {
       log.error({ accountId }, 'Account not found');
       return;
     }
     
-    // Build channel object from account
     const channel = {
       id: account.kickChannelId!,
       user_id: account.kickUserId,
@@ -104,80 +85,81 @@ class KaoticBot {
       followersCount: 0,
     } as KickChannel;
     
-    // Register message handler
     connectionManager.onMessage(accountId, async (message: KickChatMessage) => {
-      log.info({ 
-        accountId, 
-        username: message.sender.username, 
-        content: message.content.substring(0, 100),
-        isCommand: message.content.startsWith('!')
-      }, '📨 Chat message received');
-      
+      log.info({ accountId, username: message.sender.username, content: message.content.substring(0, 100), isCommand: message.content.startsWith('!') }, '📨 Chat message received');
       await this.handleMessage(accountId, message, channel);
     });
     
-    // Register event handlers
     connectionManager.onEvent(accountId, 'subscription', async (data: any) => {
-      log.info({ data }, '🎉 Subscription event');
+      log.info({ data, accountId }, '🎉 Subscription event');
       const username = data.username || data.subscriber?.username || 'Unknown';
       const months = data.months || 1;
-      alertsManager.triggerSubscription(username, months);
+      alertsManager.triggerSubscription(accountId, username, months);
+      onNewSub(accountId);
       
       const chatMsg = eventMessagesService.getSubscriptionMessage(accountId, username);
-      if (chatMsg) {
-        await connectionManager.sendMessage(accountId, chatMsg);
-      }
+      if (chatMsg) await connectionManager.sendMessage(accountId, chatMsg);
     });
     
     connectionManager.onEvent(accountId, 'gifted_subscriptions', async (data: any) => {
-      log.info({ data }, '🎁 Gifted subs event');
+      log.info({ data, accountId }, '🎁 Gifted subs event');
       const gifter = data.gifter?.username || data.username || 'Unknown';
       const count = data.gifted_usernames?.length || data.count || 1;
       const recipient = data.gifted_usernames?.[0];
-      alertsManager.triggerGiftedSub(recipient || 'someone', gifter, count);
+      alertsManager.triggerGiftedSub(accountId, recipient || 'someone', gifter, count);
+      onGiftedSub(accountId, count);
       
       const chatMsg = eventMessagesService.getGiftedSubMessage(accountId, gifter, count, recipient);
-      if (chatMsg) {
-        await connectionManager.sendMessage(accountId, chatMsg);
-      }
+      if (chatMsg) await connectionManager.sendMessage(accountId, chatMsg);
     });
     
     connectionManager.onEvent(accountId, 'follow', async (data: any) => {
-      log.info({ data }, '💚 Follow event');
+      log.info({ data, accountId }, '💚 Follow event');
       const username = data.username || data.follower?.username || 'Unknown';
-      alertsManager.triggerFollow(username);
+      const oderId = data.user_id || data.follower?.id || 0;
+      alertsManager.triggerFollow(accountId, username);
+      onNewFollower(accountId, username, oderId);
       
       const chatMsg = eventMessagesService.getFollowMessage(accountId, username);
-      if (chatMsg) {
-        await connectionManager.sendMessage(accountId, chatMsg);
-      }
+      if (chatMsg) await connectionManager.sendMessage(accountId, chatMsg);
     });
     
     connectionManager.onEvent(accountId, 'kick', async (data: any) => {
-      log.info({ data }, '👟 Kick event');
+      log.info({ data, accountId }, '👟 Kick event');
       const username = data.username || data.sender?.username || 'Unknown';
       const count = data.count || data.amount || 1;
-      alertsManager.triggerKick(username, count);
+      alertsManager.triggerKick(accountId, username, count);
       
       const chatMsg = eventMessagesService.getKickMessage(accountId, username, count);
-      if (chatMsg) {
-        await connectionManager.sendMessage(accountId, chatMsg);
-      }
+      if (chatMsg) await connectionManager.sendMessage(accountId, chatMsg);
     });
     
     connectionManager.onEvent(accountId, 'raid', async (data: any) => {
-      log.info({ data }, '⚔️ Raid event');
+      log.info({ data, accountId }, '⚔️ Raid event');
       const username = data.username || data.raider?.username || 'Unknown';
       const viewers = data.viewers || data.viewer_count || 1;
-      alertsManager.triggerRaid(username, viewers);
+      alertsManager.triggerRaid(accountId, username, viewers);
       
       const chatMsg = eventMessagesService.getRaidMessage(accountId, username, viewers);
-      if (chatMsg) {
-        await connectionManager.sendMessage(accountId, chatMsg);
-      }
+      if (chatMsg) await connectionManager.sendMessage(accountId, chatMsg);
     });
     
-    // Create timer manager for this account
+    connectionManager.onEvent(accountId, 'stream_start', async (data: any) => {
+      log.info({ data, accountId }, '🔴 Stream started');
+      await onStreamLive(accountId, {
+        title: data.title || data.livestream?.session_title || 'Live Stream',
+        category: data.category?.name || data.livestream?.categories?.[0]?.name || 'Just Chatting',
+        viewerCount: data.viewer_count || 0,
+        streamId: data.id || data.livestream?.id?.toString(),
+        thumbnailUrl: data.thumbnail?.url,
+      });
+    });
+    
+    connectionManager.onEvent(accountId, 'stream_end', async (data: any) => {
+      log.info({ data, accountId }, '⚫ Stream ended');
+      await onStreamOffline(accountId);
+    });
+    
     const timerManager = new TimerManager(
       account.kickChatroomId!,
       async (chatroomId: number, content: string) => {
@@ -190,25 +172,17 @@ class KaoticBot {
     log.info({ accountId, channelSlug: account.kickChannelSlug }, 'Account handlers set up');
   }
   
-  /**
-   * Clean up handlers when account disconnects
-   */
   cleanupAccountHandlers(accountId: number): void {
     const timerManager = timerManagers.get(accountId);
     if (timerManager) {
       timerManager.stop();
       timerManagers.delete(accountId);
     }
-    
     log.info({ accountId }, 'Account handlers cleaned up');
   }
   
-  /**
-   * Start timer managers for all connected accounts
-   */
   private startTimerManagers(): void {
     const statuses = connectionManager.getAllStatuses();
-    
     for (const status of statuses) {
       if (status.status === 'connected') {
         this.setupAccountHandlers(status.accountId);
@@ -216,55 +190,33 @@ class KaoticBot {
     }
   }
   
-  /**
-   * Handle chat message for a specific account
-   */
-  private async handleMessage(
-    accountId: number, 
-    message: KickChatMessage, 
-    channel: KickChannel
-  ): Promise<void> {
-    // Track message for timers
+  private async handleMessage(accountId: number, message: KickChatMessage, channel: KickChannel): Promise<void> {
     const timerManager = timerManagers.get(accountId);
-    if (timerManager) {
-      timerManager.onChatMessage();
-    }
+    if (timerManager) timerManager.onChatMessage();
     
-    // Award points for chatting
+    onChatMessage(accountId, message.sender.id.toString(), message.sender.username);
+    
     try {
       const sender = message.sender as any;
-      await pointsService.awardMessagePoints(
-        message.sender.id,
-        message.sender.username,
-        message.sender.username,
-        sender.is_subscribed || false
-      );
+      await pointsService.awardMessagePoints(message.sender.id, message.sender.username, message.sender.username, sender.is_subscribed || false);
     } catch (err) {
       log.debug({ err }, 'Failed to award message points');
     }
     
-    // Run moderation check
     const wasModerated = await this.moderateMessage(accountId, message, channel);
     if (wasModerated) {
       log.info({ username: message.sender.username }, '🛡️ Message was moderated');
       return;
     }
     
-    // Track user for $(randomuser)
     commandHandler.trackUser(message.chatroom_id, message.sender.username);
     
-    // Check if it's a command
-    if (!message.content.startsWith('!')) {
-      return;
-    }
+    if (!message.content.startsWith('!')) return;
     
     log.info({ content: message.content }, '⚡ Processing potential command');
     
-    // Check for built-in commands first (like !clip)
     const parsed = message.content.slice(1).trim().split(/\s+/);
     const cmdName = parsed[0]?.toLowerCase();
-    
-    // Built-in commands always available
     const isBuiltIn = ['clip'].includes(cmdName);
     
     if (!isBuiltIn && !commandHandler.isCommand(message.content)) {
@@ -274,7 +226,6 @@ class KaoticBot {
     
     log.info({ content: message.content, username: message.sender.username }, '✅ Valid command, processing...');
     
-    // Send reply helper
     const sendReply = async (content: string) => {
       log.info({ content: content.substring(0, 100) }, '📤 Sending reply...');
       const result = await connectionManager.sendMessage(accountId, content);
@@ -285,19 +236,13 @@ class KaoticBot {
       }
     };
     
-    // Process command - pass accountId for built-in commands like !clip
     await commandHandler.processCommand(message, channel, sendReply, accountId);
   }
   
-  /**
-   * Get user level from badges
-   */
   private getUserLevel(sender: KickChatMessage['sender'], channel: KickChannel): UserLevel {
     const badges = sender.identity?.badges || [];
     
-    if (sender.id === channel.user_id) {
-      return 'broadcaster';
-    }
+    if (sender.id === channel.user_id) return 'broadcaster';
     
     for (const badge of badges) {
       const badgeType = badge.type.toLowerCase();
@@ -308,13 +253,9 @@ class KaoticBot {
     }
     
     if ((sender as any).is_subscribed) return 'subscriber';
-    
     return 'everyone';
   }
   
-  /**
-   * Build user context for moderation
-   */
   private buildUserContext(sender: KickChatMessage['sender'], channel: KickChannel): UserContext {
     const level = this.getUserLevel(sender, channel);
     const isBroadcaster = sender.id === channel.user_id;
@@ -331,35 +272,16 @@ class KaoticBot {
     };
   }
   
-  /**
-   * Moderation check
-   */
-  private async moderateMessage(
-    accountId: number,
-    message: KickChatMessage, 
-    channel: KickChannel
-  ): Promise<boolean> {
+  private async moderateMessage(accountId: number, message: KickChatMessage, channel: KickChannel): Promise<boolean> {
     try {
       const userContext = this.buildUserContext(message.sender, channel);
       const result = await moderationService.checkMessage(accountId, message.content, userContext);
       
-      if (!result.shouldAct || result.action === 'none') {
-        return false;
-      }
+      if (!result.shouldAct || result.action === 'none') return false;
       
-      log.info({
-        user: message.sender.username,
-        action: result.action,
-        reason: result.reason,
-        filter: result.filterType,
-      }, 'Moderation triggered');
+      log.info({ user: message.sender.username, action: result.action, reason: result.reason, filter: result.filterType }, 'Moderation triggered');
       
-      // Get account tokens
-      const account = db.select()
-        .from(schema.accounts)
-        .where(eq(schema.accounts.id, accountId))
-        .get();
-      
+      const account = db.select().from(schema.accounts).where(eq(schema.accounts.id, accountId)).get();
       if (!account) return false;
       
       try {
@@ -367,24 +289,16 @@ class KaoticBot {
           case 'delete':
             await kickApi.deleteMessage(message.id, account.accessToken);
             break;
-            
           case 'timeout':
             await kickApi.deleteMessage(message.id, account.accessToken);
-            await kickApi.timeoutUser(
-              message.sender.id, 
-              result.duration || 60, 
-              result.reason,
-              account.accessToken
-            );
+            await kickApi.timeoutUser(message.sender.id, result.duration || 60, result.reason, account.accessToken);
             break;
-            
           case 'ban':
             await kickApi.deleteMessage(message.id, account.accessToken);
             await kickApi.banUser(message.sender.id, result.reason, account.accessToken);
             break;
         }
         
-        // Log the action
         moderationService.logAction(accountId, {
           targetUserId: message.sender.id,
           targetUsername: message.sender.username,
@@ -395,13 +309,11 @@ class KaoticBot {
           messageId: message.id,
           filterType: result.filterType || undefined,
         });
-        
       } catch (err) {
         log.error({ err, action: result.action }, 'Failed to execute moderation action');
       }
       
       return true;
-      
     } catch (err) {
       log.error({ err }, 'Error in moderation check');
       return false;
@@ -411,18 +323,13 @@ class KaoticBot {
   async stop(): Promise<void> {
     log.info('Stopping KaoticBot...');
     
-    // Stop all timer managers
     for (const [accountId, manager] of timerManagers) {
       manager.stop();
     }
     timerManagers.clear();
     
-    // Shutdown connection manager
     await connectionManager.shutdown();
-    
-    // Shutdown Discord bot
     await shutdownDiscordBot();
-    
     pointsService.stop();
     
     this.isRunning = false;
@@ -430,7 +337,6 @@ class KaoticBot {
   }
 }
 
-// Main entry point
 const bot = new KaoticBot();
 
 bot.start().catch((err) => {
@@ -438,7 +344,6 @@ bot.start().catch((err) => {
   process.exit(1);
 });
 
-// Handle graceful shutdown
 process.on('SIGINT', async () => {
   await bot.stop();
   process.exit(0);
