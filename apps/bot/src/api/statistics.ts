@@ -8,7 +8,7 @@ import puppeteer from 'puppeteer';
 
 const log = createChildLogger('statistics');
 
-// Cache for channel data to avoid hitting API too frequently
+// Cache for channel data to avoid excessive Puppeteer launches
 const channelDataCache = new Map<string, { data: any; timestamp: number }>();
 const CACHE_TTL = 60000; // 1 minute cache
 
@@ -35,7 +35,7 @@ async function getKickChannelData(channelSlug: string): Promise<any | null> {
     // Set a realistic user agent
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     
-    // Navigate to the API endpoint
+    // Navigate to the v2 API endpoint
     const response = await page.goto(`https://kick.com/api/v2/channels/${channelSlug}`, {
       waitUntil: 'networkidle0',
       timeout: 15000,
@@ -70,6 +70,11 @@ export async function registerStatisticsRoutes(app: FastifyInstance) {
   // Overview statistics
   app.get('/api/statistics/overview', { preHandler: requireAuth }, async (request) => {
     const { account } = request as AuthenticatedRequest;
+
+    log.info({ 
+      accountId: account.id,
+      channelSlug: account.kickChannelSlug,
+    }, 'Statistics overview requested');
 
     // Check if currently live via connection manager
     const status = connectionManager.getStatus(account.id);
@@ -110,17 +115,6 @@ export async function registerStatisticsRoutes(app: FastifyInstance) {
       }
     }
 
-    // Fallback to bot connection status if API call didn't show live
-    if (!isLive && botConnected && currentStream) {
-      isLive = true;
-      liveStreamData = {
-        title: currentStream.title || 'Untitled Stream',
-        category: currentStream.category || 'Unknown',
-        viewers: currentStream.peakViewers || 0,
-        startedAt: currentStream.startedAt?.toISOString(),
-      };
-    }
-
     // Get total streams count
     const streamsResult = db.select({
       count: sql<number>`COUNT(*)`
@@ -147,7 +141,12 @@ export async function registerStatisticsRoutes(app: FastifyInstance) {
 
     return {
       isLive,
-      currentStream: liveStreamData,
+      currentStream: liveStreamData || (currentStream ? {
+        title: currentStream.title || 'Untitled Stream',
+        category: currentStream.category || 'Unknown',
+        viewers: currentStream.peakViewers || 0,
+        startedAt: currentStream.startedAt?.toISOString(),
+      } : null),
       followerCount,
       totalStreams,
       totalStreamTime,
