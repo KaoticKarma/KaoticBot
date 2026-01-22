@@ -13,6 +13,7 @@ import Discord from './Discord';
 import Clips from './Clips';
 import Statistics from './Statistics';
 import Settings from './Settings';
+import Documentation from './Documentation';
 
 // Loading spinner component
 function LoadingScreen() {
@@ -105,6 +106,7 @@ function AppContent() {
         <Route path="clips" element={<Clips />} />
         <Route path="statistics" element={<Statistics />} />
         <Route path="settings" element={<Settings />} />
+        <Route path="docs" element={<Documentation />} />
       </Route>
 
       {/* Catch all - redirect to home */}
