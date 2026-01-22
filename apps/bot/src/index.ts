@@ -9,6 +9,9 @@ import { alertsManager } from './alerts/manager.js';
 import { pointsService } from './points/service.js';
 import { moderationService, type UserContext, type UserLevel } from './moderation/service.js';
 import { eventMessagesService } from './events/service.js';
+import { firstTimeChatService } from './features/first-time-chat.js';
+import { queueService } from './features/queue.js';
+import { giveawayService } from './features/giveaway.js';
 import { initializeDiscordBot, shutdownDiscordBot } from './discord/service.js';
 import { createChildLogger } from './utils/logger.js';
 import { eq } from 'drizzle-orm';
@@ -20,7 +23,15 @@ const log = createChildLogger('main');
 const timerManagers = new Map<number, TimerManager>();
 
 // Built-in command names (these skip database lookup)
-const BUILT_IN_COMMANDS = ['clip', 'points', 'gamble', 'bet', 'give', 'leaderboard', 'top'];
+const BUILT_IN_COMMANDS = [
+  'clip', 
+  // Points commands
+  'points', 'gamble', 'bet', 'give', 'leaderboard', 'top',
+  // Queue commands
+  'join', 'sr', 'queue', 'q', 'removesr', 'nextsr', 'position', 'pos', 'startsr', 'closesr', 'clearsr',
+  // Giveaway commands
+  'giveaway', 'gw',
+];
 
 class KaoticBot {
   private isRunning = false;
@@ -82,6 +93,9 @@ class KaoticBot {
       log.error({ accountId }, 'Account not found');
       return;
     }
+    
+    // Initialize first-time chatter cache for this account
+    firstTimeChatService.initializeAccount(accountId);
     
     // Build channel object from account
     const channel = {
@@ -228,6 +242,10 @@ class KaoticBot {
     message: KickChatMessage, 
     channel: KickChannel
   ): Promise<void> {
+    const sender = message.sender as any;
+    const isSubscriber = sender.is_subscribed || false;
+    const isFollower = sender.is_following || false;
+    
     // Track message for timers
     const timerManager = timerManagers.get(accountId);
     if (timerManager) {
@@ -236,15 +254,48 @@ class KaoticBot {
     
     // Award points for chatting
     try {
-      const sender = message.sender as any;
       await pointsService.awardMessagePoints(
         message.sender.id,
         message.sender.username,
         message.sender.username,
-        sender.is_subscribed || false
+        isSubscriber
       );
     } catch (err) {
       log.debug({ err }, 'Failed to award message points');
+    }
+    
+    // Check for first-time chatter
+    try {
+      const welcomeMsg = await firstTimeChatService.checkFirstTimeChatter(
+        accountId,
+        message.sender.id,
+        message.sender.username
+      );
+      if (welcomeMsg) {
+        await connectionManager.sendMessage(accountId, welcomeMsg);
+      }
+    } catch (err) {
+      log.debug({ err }, 'Failed first-time chatter check');
+    }
+    
+    // Check for giveaway entry (non-command messages)
+    if (!message.content.startsWith('!')) {
+      try {
+        const entryResult = giveawayService.processEntry(
+          accountId,
+          message.sender.id,
+          message.sender.username,
+          message.content,
+          isSubscriber,
+          isFollower
+        );
+        // Only send message if there's an error (e.g., sub-only)
+        if (entryResult.message && !entryResult.entered) {
+          await connectionManager.sendMessage(accountId, entryResult.message);
+        }
+      } catch (err) {
+        log.debug({ err }, 'Failed giveaway entry check');
+      }
     }
     
     // Run moderation check
@@ -289,7 +340,9 @@ class KaoticBot {
         message,
         channel,
         accountId,
-        sendReply
+        sendReply,
+        isSubscriber,
+        isFollower
       );
       if (handled) return;
     }
@@ -315,16 +368,21 @@ class KaoticBot {
     message: KickChatMessage,
     channel: KickChannel,
     accountId: number,
-    sendReply: (content: string) => Promise<void>
+    sendReply: (content: string) => Promise<void>,
+    isSubscriber: boolean,
+    isFollower: boolean
   ): Promise<boolean> {
     const username = message.sender.username;
     const userId = message.sender.id;
+    const userLevel = this.getUserLevel(message.sender, channel);
+    const isMod = userLevel === 'moderator' || userLevel === 'broadcaster';
     
     switch (cmdName) {
+      // ============== CLIP ==============
       case 'clip':
-        // Delegate to command handler's clip implementation
         return await commandHandler.processCommand(message, channel, sendReply, accountId);
       
+      // ============== POINTS COMMANDS ==============
       case 'points': {
         const stats = await pointsService.getUserStats(userId);
         if (stats) {
@@ -394,7 +452,6 @@ class KaoticBot {
           return true;
         }
         
-        // Find target user in database
         const targetUsers = db.select()
           .from(schema.users)
           .where(eq(schema.users.username, targetName))
@@ -435,6 +492,161 @@ class KaoticBot {
         
         await sendReply(`🏆 Top 5: ${entries}`);
         return true;
+      }
+      
+      // ============== QUEUE COMMANDS ==============
+      case 'join':
+      case 'sr': {
+        const note = args.join(' ') || undefined; // Optional gamertag/note
+        const result = queueService.join(accountId, userId, username, isSubscriber, note);
+        await sendReply(result.message);
+        return true;
+      }
+      
+      case 'removesr': {
+        const result = queueService.leave(accountId, userId, username);
+        await sendReply(result.message);
+        return true;
+      }
+      
+      case 'queue':
+      case 'q': {
+        const list = queueService.list(accountId, 5);
+        await sendReply(list);
+        return true;
+      }
+      
+      case 'position':
+      case 'pos': {
+        const pos = queueService.position(accountId, userId, username);
+        await sendReply(pos);
+        return true;
+      }
+      
+      case 'nextsr': {
+        if (!isMod) {
+          await sendReply(`@${username} Only moderators can use !nextsr`);
+          return true;
+        }
+        const result = queueService.next(accountId);
+        await sendReply(result.message);
+        return true;
+      }
+      
+      case 'startsr': {
+        if (!isMod) {
+          await sendReply(`@${username} Only moderators can use !startsr`);
+          return true;
+        }
+        const msg = await queueService.setEnabled(accountId, true);
+        await sendReply(msg);
+        return true;
+      }
+      
+      case 'closesr': {
+        if (!isMod) {
+          await sendReply(`@${username} Only moderators can use !closesr`);
+          return true;
+        }
+        const msg = await queueService.setEnabled(accountId, false);
+        await sendReply(msg);
+        return true;
+      }
+      
+      case 'clearsr': {
+        if (!isMod) {
+          await sendReply(`@${username} Only moderators can use !clearsr`);
+          return true;
+        }
+        const msg = queueService.clear(accountId);
+        await sendReply(msg);
+        return true;
+      }
+      
+      // ============== GIVEAWAY COMMANDS ==============
+      case 'giveaway':
+      case 'gw': {
+        const subCommand = args[0]?.toLowerCase();
+        
+        if (!subCommand) {
+          // Show status
+          await sendReply(giveawayService.status(accountId));
+          return true;
+        }
+        
+        switch (subCommand) {
+          case 'start': {
+            if (!isMod) {
+              await sendReply(`@${username} Only moderators can start giveaways!`);
+              return true;
+            }
+            
+            // !giveaway start <keyword> <prize...> OR !giveaway start <keyword> <duration>m <prize...>
+            if (args.length < 3) {
+              await sendReply(`Usage: !giveaway start <keyword> <prize> OR !giveaway start <keyword> <duration>m <prize>`);
+              return true;
+            }
+            
+            const keyword = args[1].toLowerCase();
+            let duration: number | undefined;
+            let prizeStart = 2;
+            
+            // Check if second arg is duration (ends with 'm')
+            if (args[2]?.match(/^\d+m$/)) {
+              duration = parseInt(args[2], 10);
+              prizeStart = 3;
+            }
+            
+            const prize = args.slice(prizeStart).join(' ');
+            
+            if (!prize) {
+              await sendReply(`Usage: !giveaway start <keyword> <prize>`);
+              return true;
+            }
+            
+            const result = giveawayService.start(accountId, keyword, prize, username, duration);
+            await sendReply(result.message);
+            return true;
+          }
+          
+          case 'end':
+          case 'pick': {
+            if (!isMod) {
+              await sendReply(`@${username} Only moderators can end giveaways!`);
+              return true;
+            }
+            
+            const result = giveawayService.end(accountId);
+            await sendReply(result.message);
+            return true;
+          }
+          
+          case 'reroll': {
+            if (!isMod) {
+              await sendReply(`@${username} Only moderators can reroll!`);
+              return true;
+            }
+            
+            const result = giveawayService.reroll(accountId);
+            await sendReply(result.message);
+            return true;
+          }
+          
+          case 'cancel': {
+            if (!isMod) {
+              await sendReply(`@${username} Only moderators can cancel giveaways!`);
+              return true;
+            }
+            
+            const result = giveawayService.cancel(accountId);
+            await sendReply(result.message);
+            return true;
+          }
+          
+          default:
+            await sendReply(`Unknown subcommand. Use: !giveaway start/end/reroll/cancel`);
+            return true;
+        }
       }
       
       default:

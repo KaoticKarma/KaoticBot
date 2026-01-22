@@ -267,8 +267,8 @@ registerVariable('date', () => {
   });
 });
 
-// Latency - returns the current WebSocket latency in ms
-registerVariable('latency', () => `${currentLatency}ms`);
+// Latency - returns the current latency in ms (number only)
+registerVariable('latency', () => `${currentLatency}`);
 
 // Followage placeholder (requires API call - will be implemented in command handler)
 registerVariable('followage', () => 'Unknown');
