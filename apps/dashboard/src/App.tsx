@@ -11,6 +11,7 @@ import Points from './Points';
 import Moderation from './Moderation';
 import Discord from './Discord';
 import Clips from './Clips';
+import Statistics from './Statistics';
 import Settings from './Settings';
 
 // Loading spinner component
@@ -102,6 +103,7 @@ function AppContent() {
         <Route path="moderation" element={<Moderation />} />
         <Route path="discord" element={<Discord />} />
         <Route path="clips" element={<Clips />} />
+        <Route path="statistics" element={<Statistics />} />
         <Route path="settings" element={<Settings />} />
       </Route>
 
