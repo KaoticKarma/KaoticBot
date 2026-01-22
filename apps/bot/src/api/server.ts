@@ -12,13 +12,14 @@ import { db, schema } from '../db/index.js';
 import { eq, and, desc, isNull, or } from 'drizzle-orm';
 import { createChildLogger } from '../utils/logger.js';
 import { alertsManager } from '../alerts/manager.js';
-import { initializeTracker, getCurrentSessionStats, getRecentSessions, getCategoryStats, getRecentFollowers, getFollowerCount } from '../stats/tracker.js';
+import { initializeTracker } from '../stats/tracker.js';
 import { connectionManager } from '../connections/manager.js';
 import { isDiscordReady, testDiscordConnection, getBotGuilds, getGuildChannels, getGuildRoles, getBotInviteUrl } from '../discord/service.js';
 import { readFileSync, createWriteStream, existsSync, mkdirSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { pipeline } from 'stream/promises';
+import { registerStatisticsRoutes } from './statistics.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -31,13 +32,16 @@ export function setTimerManager(manager: any) { timerManagerInstance = manager; 
 export function setBotInstance(bot: any) { botInstance = bot; log.info('Bot instance connected'); }
 export function setConnectionManager(manager: typeof connectionManager) { log.info('Connection manager connected'); }
 
+// Generate a URL-safe token
 function generateWidgetToken(): string {
   return crypto.randomBytes(24).toString('base64url');
 }
 
+// Get or create widget token for an account
 function getOrCreateWidgetToken(accountId: number): string {
   let existing = db.select().from(schema.widgetTokens).where(eq(schema.widgetTokens.accountId, accountId)).get();
   if (existing) return existing.token;
+  
   const token = generateWidgetToken();
   db.insert(schema.widgetTokens).values({ accountId, token }).run();
   return token;
@@ -47,7 +51,14 @@ export async function startServer() {
   const app = Fastify({ logger: false });
   await app.register(cors, { origin: true, credentials: true });
   await app.register(cookie, { secret: config.SESSION_SECRET });
-  await app.register(fastifyMultipart, { limits: { fileSize: 100 * 1024 * 1024, files: 1 }, attachFieldsToBody: false });
+  await app.register(fastifyMultipart, { 
+    limits: { 
+      fileSize: 100 * 1024 * 1024,  // 100MB max
+      files: 1,
+    },
+    // Optimize for larger files - higher water mark = larger chunks = faster
+    attachFieldsToBody: false,
+  });
   
   const alertsDir = join(__dirname, '../../data/alerts');
   if (!existsSync(alertsDir)) mkdirSync(alertsDir, { recursive: true });
@@ -62,8 +73,10 @@ export async function startServer() {
   try { await app.register(fastifyStatic, { root: clipsDir, prefix: '/clips/media/', decorateReply: false }); }
   catch (error) { log.warn({ error }, 'Clips static file serving disabled'); }
 
+  // Health Check
   app.get('/health', async () => ({ status: 'ok', authenticated: kickApi.isAuthenticated() }));
 
+  // Auth Routes
   app.get('/auth/login', async (request, reply) => {
     const { url, state } = generateAuthUrl();
     reply.setCookie('oauth_state', state, { httpOnly: true, secure: config.NODE_ENV === 'production', sameSite: 'lax', maxAge: 600, path: '/' });
@@ -134,6 +147,7 @@ export async function startServer() {
     return { success: true };
   });
 
+  // Bot Control Routes
   app.post('/api/bot/enable', { preHandler: requireAuth }, async (request, reply) => {
     const { account } = request as AuthenticatedRequest;
     if (!account.kickChannelId || !account.kickChatroomId) return reply.code(400).send({ success: false, error: 'No channel found.' });
@@ -175,6 +189,7 @@ export async function startServer() {
     return await connectionManager.sendMessage(account.id, body.message || 'Test from KaoticBot! 🤖');
   });
 
+  // Commands API
   app.get('/api/commands', { preHandler: requireAuth }, async (request) => {
     const { account } = request as AuthenticatedRequest;
     return db.select().from(schema.commands).where(or(eq(schema.commands.accountId, account.id), isNull(schema.commands.accountId))).orderBy(schema.commands.name).all();
@@ -219,6 +234,7 @@ export async function startServer() {
     return { success: result.changes > 0 };
   });
 
+  // Timers API
   app.get('/api/timers', { preHandler: requireAuth }, async (request) => {
     const { account } = request as AuthenticatedRequest;
     return db.select().from(schema.timers).where(or(eq(schema.timers.accountId, account.id), isNull(schema.timers.accountId))).all();
@@ -252,6 +268,10 @@ export async function startServer() {
     return { success: true };
   });
 
+  // ============================================
+  // Widget Token API
+  // ============================================
+
   app.get('/api/widget/token', { preHandler: requireAuth }, async (request) => {
     const { account } = request as AuthenticatedRequest;
     const token = getOrCreateWidgetToken(account.id);
@@ -261,62 +281,119 @@ export async function startServer() {
   app.post('/api/widget/token/regenerate', { preHandler: requireAuth }, async (request) => {
     const { account } = request as AuthenticatedRequest;
     const newToken = generateWidgetToken();
+    
     const existing = db.select().from(schema.widgetTokens).where(eq(schema.widgetTokens.accountId, account.id)).get();
     if (existing) {
       db.update(schema.widgetTokens).set({ token: newToken, updatedAt: new Date() }).where(eq(schema.widgetTokens.accountId, account.id)).run();
     } else {
       db.insert(schema.widgetTokens).values({ accountId: account.id, token: newToken }).run();
     }
+    
     return { token: newToken, widgetUrl: `/alerts/overlay?token=${newToken}` };
   });
 
+  // ============================================
+  // Custom Widget Configs API (Advanced Settings)
+  // ============================================
+
+  // List all custom widget configs for account
   app.get('/api/widgets', { preHandler: requireAuth }, async (request) => {
     const { account } = request as AuthenticatedRequest;
     const widgets = db.select().from(schema.widgetConfigs).where(eq(schema.widgetConfigs.accountId, account.id)).all();
-    return widgets.map(w => ({ ...w, alertTypes: JSON.parse(w.alertTypes), widgetUrl: `/alerts/overlay?token=${w.token}` }));
+    return widgets.map(w => ({
+      ...w,
+      alertTypes: JSON.parse(w.alertTypes),
+      widgetUrl: `/alerts/overlay?token=${w.token}`,
+    }));
   });
 
+  // Create new custom widget config
   app.post('/api/widgets', { preHandler: requireAuth }, async (request, reply) => {
     const { account } = request as AuthenticatedRequest;
     const body = request.body as { name: string; alertTypes: string[] };
+    
     if (!body.name || !body.alertTypes || !Array.isArray(body.alertTypes)) {
       return reply.code(400).send({ error: 'Name and alertTypes array required' });
     }
+    
     const token = generateWidgetToken();
-    const result = db.insert(schema.widgetConfigs).values({ accountId: account.id, token, name: body.name, alertTypes: JSON.stringify(body.alertTypes) }).run();
+    const result = db.insert(schema.widgetConfigs).values({
+      accountId: account.id,
+      token,
+      name: body.name,
+      alertTypes: JSON.stringify(body.alertTypes),
+    }).run();
+    
     const widget = db.select().from(schema.widgetConfigs).where(eq(schema.widgetConfigs.id, Number(result.lastInsertRowid))).get();
-    return { ...widget, alertTypes: JSON.parse(widget!.alertTypes), widgetUrl: `/alerts/overlay?token=${token}` };
+    return {
+      ...widget,
+      alertTypes: JSON.parse(widget!.alertTypes),
+      widgetUrl: `/alerts/overlay?token=${token}`,
+    };
   });
 
+  // Update custom widget config
   app.patch('/api/widgets/:id', { preHandler: requireAuth }, async (request, reply) => {
     const { account } = request as AuthenticatedRequest;
     const { id } = request.params as { id: string };
     const body = request.body as { name?: string; alertTypes?: string[] };
-    const existing = db.select().from(schema.widgetConfigs).where(and(eq(schema.widgetConfigs.id, parseInt(id, 10)), eq(schema.widgetConfigs.accountId, account.id))).get();
+    
+    const existing = db.select().from(schema.widgetConfigs)
+      .where(and(eq(schema.widgetConfigs.id, parseInt(id, 10)), eq(schema.widgetConfigs.accountId, account.id)))
+      .get();
+    
     if (!existing) return reply.code(404).send({ error: 'Widget config not found' });
-    db.update(schema.widgetConfigs).set({ name: body.name ?? existing.name, alertTypes: body.alertTypes ? JSON.stringify(body.alertTypes) : existing.alertTypes, updatedAt: new Date() }).where(eq(schema.widgetConfigs.id, parseInt(id, 10))).run();
+    
+    db.update(schema.widgetConfigs).set({
+      name: body.name ?? existing.name,
+      alertTypes: body.alertTypes ? JSON.stringify(body.alertTypes) : existing.alertTypes,
+      updatedAt: new Date(),
+    }).where(eq(schema.widgetConfigs.id, parseInt(id, 10))).run();
+    
     const updated = db.select().from(schema.widgetConfigs).where(eq(schema.widgetConfigs.id, parseInt(id, 10))).get();
-    return { ...updated, alertTypes: JSON.parse(updated!.alertTypes), widgetUrl: `/alerts/overlay?token=${updated!.token}` };
+    return {
+      ...updated,
+      alertTypes: JSON.parse(updated!.alertTypes),
+      widgetUrl: `/alerts/overlay?token=${updated!.token}`,
+    };
   });
 
+  // Delete custom widget config
   app.delete('/api/widgets/:id', { preHandler: requireAuth }, async (request, reply) => {
     const { account } = request as AuthenticatedRequest;
     const { id } = request.params as { id: string };
-    const existing = db.select().from(schema.widgetConfigs).where(and(eq(schema.widgetConfigs.id, parseInt(id, 10)), eq(schema.widgetConfigs.accountId, account.id))).get();
+    
+    const existing = db.select().from(schema.widgetConfigs)
+      .where(and(eq(schema.widgetConfigs.id, parseInt(id, 10)), eq(schema.widgetConfigs.accountId, account.id)))
+      .get();
+    
     if (!existing) return reply.code(404).send({ error: 'Widget config not found' });
+    
     db.delete(schema.widgetConfigs).where(eq(schema.widgetConfigs.id, parseInt(id, 10))).run();
     return { success: true };
   });
 
+  // Regenerate token for custom widget
   app.post('/api/widgets/:id/regenerate', { preHandler: requireAuth }, async (request, reply) => {
     const { account } = request as AuthenticatedRequest;
     const { id } = request.params as { id: string };
-    const existing = db.select().from(schema.widgetConfigs).where(and(eq(schema.widgetConfigs.id, parseInt(id, 10)), eq(schema.widgetConfigs.accountId, account.id))).get();
+    
+    const existing = db.select().from(schema.widgetConfigs)
+      .where(and(eq(schema.widgetConfigs.id, parseInt(id, 10)), eq(schema.widgetConfigs.accountId, account.id)))
+      .get();
+    
     if (!existing) return reply.code(404).send({ error: 'Widget config not found' });
+    
     const newToken = generateWidgetToken();
-    db.update(schema.widgetConfigs).set({ token: newToken, updatedAt: new Date() }).where(eq(schema.widgetConfigs.id, parseInt(id, 10))).run();
+    db.update(schema.widgetConfigs).set({ token: newToken, updatedAt: new Date() })
+      .where(eq(schema.widgetConfigs.id, parseInt(id, 10))).run();
+    
     return { token: newToken, widgetUrl: `/alerts/overlay?token=${newToken}` };
   });
+
+  // ============================================
+  // Alerts API (with full styling support)
+  // ============================================
 
   app.get('/api/alerts', { preHandler: requireAuth }, async (request) => {
     const { account } = request as AuthenticatedRequest;
@@ -327,11 +404,33 @@ export async function startServer() {
     const { account } = request as AuthenticatedRequest;
     const body = request.body as any;
     if (!body.type || !body.message) return reply.code(400).send({ error: 'Type and message required' });
+    
     const result = db.insert(schema.alerts).values({
-      accountId: account.id, type: body.type, minAmount: body.minAmount || 1, maxAmount: body.maxAmount, message: body.message, sound: body.sound, imageUrl: body.imageUrl, videoUrl: body.videoUrl, duration: body.duration || 5000, enabled: body.enabled ?? true,
-      layout: body.layout || 'above', animation: body.animation || 'fade', volume: body.volume ?? 50, topTextColor: body.topTextColor || '#ffffff', bottomTextColor: body.bottomTextColor || '#ffffff', font: body.font || 'Impact', textPositionY: body.textPositionY ?? 0,
-      customCodeEnabled: body.customCodeEnabled ?? false, customHtml: body.customHtml || null, customCss: body.customCss || null, customJs: body.customJs || null,
+      accountId: account.id,
+      type: body.type,
+      minAmount: body.minAmount || 1,
+      maxAmount: body.maxAmount,
+      message: body.message,
+      sound: body.sound,
+      imageUrl: body.imageUrl,
+      videoUrl: body.videoUrl,
+      duration: body.duration || 5000,
+      enabled: body.enabled ?? true,
+      // Styling fields
+      layout: body.layout || 'above',
+      animation: body.animation || 'fade',
+      volume: body.volume ?? 50,
+      topTextColor: body.topTextColor || '#ffffff',
+      bottomTextColor: body.bottomTextColor || '#ffffff',
+      font: body.font || 'Impact',
+      textPositionY: body.textPositionY ?? 0,
+      // Custom code fields
+      customCodeEnabled: body.customCodeEnabled ?? false,
+      customHtml: body.customHtml || null,
+      customCss: body.customCss || null,
+      customJs: body.customJs || null,
     }).run();
+    
     return db.select().from(schema.alerts).where(eq(schema.alerts.id, Number(result.lastInsertRowid))).get();
   });
 
@@ -339,24 +438,47 @@ export async function startServer() {
     const { account } = request as AuthenticatedRequest;
     const { id } = request.params as { id: string };
     const body = request.body as any;
+    
     log.info({ alertId: id, accountId: account.id, body }, 'PATCH alert request received');
+    
     const existing = db.select().from(schema.alerts).where(and(eq(schema.alerts.id, parseInt(id, 10)), or(eq(schema.alerts.accountId, account.id), isNull(schema.alerts.accountId)))).get();
     if (!existing) return reply.code(404).send({ error: 'Alert not found' });
+    
     log.info({ existingAlert: existing }, 'Existing alert before update');
+    
     const updateData = {
-      type: body.type ?? existing.type, minAmount: body.minAmount ?? existing.minAmount, maxAmount: body.maxAmount !== undefined ? body.maxAmount : existing.maxAmount, message: body.message ?? existing.message,
-      sound: body.sound !== undefined ? body.sound : existing.sound, imageUrl: body.imageUrl !== undefined ? body.imageUrl : existing.imageUrl, videoUrl: body.videoUrl !== undefined ? body.videoUrl : existing.videoUrl,
-      duration: body.duration ?? existing.duration, enabled: body.enabled ?? existing.enabled, layout: body.layout ?? existing.layout, animation: body.animation ?? existing.animation,
-      volume: body.volume !== undefined ? body.volume : existing.volume, topTextColor: body.topTextColor ?? existing.topTextColor, bottomTextColor: body.bottomTextColor ?? existing.bottomTextColor,
-      font: body.font ?? existing.font, textPositionY: body.textPositionY !== undefined ? body.textPositionY : existing.textPositionY,
-      customCodeEnabled: body.customCodeEnabled !== undefined ? body.customCodeEnabled : existing.customCodeEnabled, customHtml: body.customHtml !== undefined ? body.customHtml : existing.customHtml,
-      customCss: body.customCss !== undefined ? body.customCss : existing.customCss, customJs: body.customJs !== undefined ? body.customJs : existing.customJs,
+      type: body.type ?? existing.type,
+      minAmount: body.minAmount ?? existing.minAmount,
+      maxAmount: body.maxAmount !== undefined ? body.maxAmount : existing.maxAmount,
+      message: body.message ?? existing.message,
+      sound: body.sound !== undefined ? body.sound : existing.sound,
+      imageUrl: body.imageUrl !== undefined ? body.imageUrl : existing.imageUrl,
+      videoUrl: body.videoUrl !== undefined ? body.videoUrl : existing.videoUrl,
+      duration: body.duration ?? existing.duration,
+      enabled: body.enabled ?? existing.enabled,
+      // Styling fields
+      layout: body.layout ?? existing.layout,
+      animation: body.animation ?? existing.animation,
+      volume: body.volume !== undefined ? body.volume : existing.volume,
+      topTextColor: body.topTextColor ?? existing.topTextColor,
+      bottomTextColor: body.bottomTextColor ?? existing.bottomTextColor,
+      font: body.font ?? existing.font,
+      textPositionY: body.textPositionY !== undefined ? body.textPositionY : existing.textPositionY,
+      // Custom code fields
+      customCodeEnabled: body.customCodeEnabled !== undefined ? body.customCodeEnabled : existing.customCodeEnabled,
+      customHtml: body.customHtml !== undefined ? body.customHtml : existing.customHtml,
+      customCss: body.customCss !== undefined ? body.customCss : existing.customCss,
+      customJs: body.customJs !== undefined ? body.customJs : existing.customJs,
     };
+    
     log.info({ updateData }, 'Data to be saved');
+    
     const result = db.update(schema.alerts).set(updateData).where(eq(schema.alerts.id, parseInt(id, 10))).run();
     log.info({ changes: result.changes }, 'Update result');
+    
     const updated = db.select().from(schema.alerts).where(eq(schema.alerts.id, parseInt(id, 10))).get();
     log.info({ updatedAlert: updated }, 'Alert after update');
+    
     return updated;
   });
 
@@ -367,12 +489,19 @@ export async function startServer() {
     return { success: true };
   });
 
+  // Alerts streaming with token support (per-account) and custom widget filtering
   app.get('/api/alerts/stream', async (request, reply) => {
     const { token } = request.query as { token?: string };
+    
+    // Validate token and get account ID + alert type filter
     let accountId: number | null = null;
-    let allowedAlertTypes: string[] | null = null;
+    let allowedAlertTypes: string[] | null = null; // null = all types allowed
+    
     if (token) {
+      // First check default widget tokens
       accountId = alertsManager.getAccountIdFromToken(token);
+      
+      // If not found in default tokens, check custom widget configs
       if (!accountId) {
         const widgetConfig = db.select().from(schema.widgetConfigs).where(eq(schema.widgetConfigs.token, token)).get();
         if (widgetConfig) {
@@ -381,43 +510,78 @@ export async function startServer() {
           log.info({ accountId, allowedAlertTypes, widgetName: widgetConfig.name }, 'Custom widget config found');
         }
       }
-      if (!accountId) return reply.code(401).send({ error: 'Invalid widget token' });
+      
+      if (!accountId) {
+        return reply.code(401).send({ error: 'Invalid widget token' });
+      }
     }
+    
     reply.raw.setHeader('Content-Type', 'text/event-stream');
     reply.raw.setHeader('Cache-Control', 'no-cache');
     reply.raw.setHeader('Connection', 'keep-alive');
     reply.raw.setHeader('Access-Control-Allow-Origin', '*');
     reply.raw.write(`data: {"type":"connected","accountId":${accountId || 'null'},"filteredTypes":${JSON.stringify(allowedAlertTypes)}}\n\n`);
+    
     const handler = (alertAccountId: number, alert: any) => {
+      // Only send alerts for this account (or all if no token)
       if (accountId === null || alertAccountId === accountId) {
+        // Check if this alert type is allowed by the widget config
         if (allowedAlertTypes !== null && !allowedAlertTypes.includes(alert.type)) {
           log.info({ alertType: alert.type, allowedTypes: allowedAlertTypes }, 'SSE: Alert filtered out by widget config');
-          return;
+          return; // Skip this alert for this widget
         }
-        log.info({ alertId: alert.id, accountId: alertAccountId, type: alert.type, message: alert.message, videoUrl: alert.videoUrl, imageUrl: alert.imageUrl, sound: alert.sound, duration: alert.duration }, 'SSE: Sending alert to overlay');
+        
+        log.info({ 
+          alertId: alert.id,
+          accountId: alertAccountId,
+          type: alert.type,
+          message: alert.message,
+          videoUrl: alert.videoUrl,
+          imageUrl: alert.imageUrl,
+          sound: alert.sound,
+          duration: alert.duration,
+        }, 'SSE: Sending alert to overlay');
         reply.raw.write(`event: alert\ndata: ${JSON.stringify(alert)}\n\n`);
       }
     };
     const skipHandler = (alertAccountId: number) => {
-      if (accountId === null || alertAccountId === accountId) reply.raw.write(`event: skip\ndata: {}\n\n`);
+      if (accountId === null || alertAccountId === accountId) {
+        reply.raw.write(`event: skip\ndata: {}\n\n`);
+      }
     };
+    
     alertsManager.on('alert_show', handler);
     alertsManager.on('alert_skipped', skipHandler);
+    
     const heartbeat = setInterval(() => reply.raw.write(': heartbeat\n\n'), 30000);
     request.raw.on('close', () => { clearInterval(heartbeat); alertsManager.off('alert_show', handler); alertsManager.off('alert_skipped', skipHandler); });
     await new Promise(() => {});
   });
 
+  // Serve overlay HTML with token validation
   app.get('/alerts/overlay', async (request, reply) => {
     const { token } = request.query as { token?: string };
+    
+    // Prevent caching of overlay HTML
     reply.header('Cache-Control', 'no-cache, no-store, must-revalidate');
     reply.header('Pragma', 'no-cache');
     reply.header('Expires', '0');
+    
+    // Read and modify the overlay HTML to include the token
     let html = readFileSync(join(__dirname, '../alerts/overlay.html'), 'utf-8');
+    
+    // Inject token into the page
     if (token) {
-      html = html.replace('const API_URL = window.location.origin;', `const API_URL = window.location.origin;\n    const WIDGET_TOKEN = '${token}';`);
-      html = html.replace('new EventSource(`${API_URL}/api/alerts/stream`)', 'new EventSource(`${API_URL}/api/alerts/stream?token=${WIDGET_TOKEN}`)');
+      html = html.replace(
+        'const API_URL = window.location.origin;',
+        `const API_URL = window.location.origin;\n    const WIDGET_TOKEN = '${token}';`
+      );
+      html = html.replace(
+        'new EventSource(`${API_URL}/api/alerts/stream`)',
+        'new EventSource(`${API_URL}/api/alerts/stream?token=${WIDGET_TOKEN}`)'
+      );
     }
+    
     reply.type('text/html').send(html);
   });
 
@@ -456,28 +620,45 @@ export async function startServer() {
   app.post('/api/alerts/upload', async (request, reply) => {
     const data = await request.file();
     if (!data) return reply.code(400).send({ error: 'No file' });
-    const allowedTypes = ['image/gif', 'image/png', 'image/jpeg', 'image/webp', 'video/mp4', 'video/webm', 'video/x-matroska', 'audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/ogg', 'audio/x-wav'];
+    
+    // More permissive MIME type checking - also check file extension
+    const allowedTypes = [
+      'image/gif', 'image/png', 'image/jpeg', 'image/webp',
+      'video/mp4', 'video/webm', 'video/x-matroska',
+      'audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/ogg', 'audio/x-wav'
+    ];
     const allowedExtensions = ['.gif', '.png', '.jpg', '.jpeg', '.webp', '.mp4', '.webm', '.mkv', '.mp3', '.wav', '.ogg'];
+    
     const ext = '.' + (data.filename.split('.').pop()?.toLowerCase() || '');
     const isAllowedType = allowedTypes.includes(data.mimetype);
     const isAllowedExt = allowedExtensions.includes(ext);
+    
     log.info({ filename: data.filename, mimetype: data.mimetype, ext }, 'File upload attempt');
+    
     if (!isAllowedType && !isAllowedExt) {
       log.warn({ filename: data.filename, mimetype: data.mimetype, ext }, 'File rejected - invalid type');
       return reply.code(400).send({ error: `Invalid file type: ${data.mimetype} (${ext})` });
     }
+    
     const filename = `${Date.now()}-${Math.random().toString(36).substring(7)}${ext}`;
     await pipeline(data.file, createWriteStream(join(alertsDir, filename)));
     log.info({ filename }, 'File uploaded successfully');
+    
+    // Build URL - detect if behind HTTPS proxy (Caddy)
+    // Check x-forwarded-proto header or NODE_ENV
     const forwardedProto = request.headers['x-forwarded-proto'];
     const isProxied = forwardedProto === 'https' || config.NODE_ENV === 'production';
     const protocol = isProxied ? 'https' : request.protocol;
-    const host = isProxied ? request.hostname : `${request.hostname}:${config.PORT}`;
+    const host = isProxied 
+      ? request.hostname  // No port - Caddy handles routing
+      : `${request.hostname}:${config.PORT}`;
     const mediaUrl = `${protocol}://${host}/alerts/media/${filename}`;
+    
     log.info({ mediaUrl, isProxied, forwardedProto }, 'Media URL generated');
     return { success: true, url: mediaUrl, filename };
   });
 
+  // Event Messages API
   app.get('/api/events', { preHandler: requireAuth }, async (request) => {
     const { account } = request as AuthenticatedRequest;
     return db.select().from(schema.eventMessages).where(or(eq(schema.eventMessages.accountId, account.id), isNull(schema.eventMessages.accountId))).all();
@@ -497,6 +678,7 @@ export async function startServer() {
     return db.select().from(schema.eventMessages).where(eq(schema.eventMessages.id, parseInt(id, 10))).get();
   });
 
+  // Moderation API
   app.get('/api/moderation/settings', { preHandler: requireAuth }, async (request) => {
     const { account } = request as AuthenticatedRequest;
     let settings = db.select().from(schema.moderationSettings).where(eq(schema.moderationSettings.accountId, account.id)).get();
@@ -539,6 +721,7 @@ export async function startServer() {
     return db.select().from(schema.modLogs).where(eq(schema.modLogs.accountId, account.id)).orderBy(desc(schema.modLogs.createdAt)).limit(parseInt(query.limit || '50', 10)).all();
   });
 
+  // Discord API
   app.get('/api/discord/status', async () => {
     const ready = isDiscordReady();
     return { connected: ready, inviteUrl: getBotInviteUrl(), guilds: ready ? getBotGuilds() : [] };
@@ -582,6 +765,7 @@ export async function startServer() {
     return reply.code(500).send({ error: 'Failed to send test message' });
   });
 
+  // Points API
   app.get('/api/points/config', { preHandler: requireAuth }, async (request) => {
     const { account } = request as AuthenticatedRequest;
     let settings = db.select().from(schema.pointsSettings).where(eq(schema.pointsSettings.accountId, account.id)).get();
@@ -610,6 +794,7 @@ export async function startServer() {
     return db.select().from(schema.channelUsers).where(eq(schema.channelUsers.accountId, account.id)).orderBy(desc(schema.channelUsers.points)).limit(parseInt(query.limit || '100', 10)).offset(parseInt(query.offset || '0', 10)).all();
   });
 
+  // Settings API
   app.get('/api/settings', { preHandler: requireAuth }, async (request) => {
     const { account } = request as AuthenticatedRequest;
     const settings = db.select().from(schema.settings).where(eq(schema.settings.accountId, account.id)).all();
@@ -628,79 +813,94 @@ export async function startServer() {
     return { success: true };
   });
 
-  // Statistics API
-  app.get('/api/statistics/overview', { preHandler: requireAuth }, async (request) => {
-    const { account } = request as AuthenticatedRequest;
-    const liveStats = getCurrentSessionStats(account.id);
-    const followerCount = getFollowerCount(account.id);
-    const recentSessions = getRecentSessions(account.id, 30);
-    let totalStreamTime = 0, totalMessages = 0, totalViewers = 0;
-    for (const session of recentSessions) {
-      if (session.endedAt) totalStreamTime += new Date(session.endedAt).getTime() - new Date(session.startedAt).getTime();
-      totalMessages += session.totalMessages || 0;
-      totalViewers += session.peakViewers || 0;
-    }
-    return { isLive: liveStats !== null, currentStream: liveStats, followerCount, totalStreams: recentSessions.length, totalStreamTime, totalMessages, avgPeakViewers: recentSessions.length > 0 ? Math.round(totalViewers / recentSessions.length) : 0 };
-  });
-
-  app.get('/api/statistics/streams', { preHandler: requireAuth }, async (request) => {
-    const { account } = request as AuthenticatedRequest;
-    const query = request.query as { limit?: string };
-    const sessions = getRecentSessions(account.id, parseInt(query.limit || '5', 10));
-    return sessions.map(session => {
-      const duration = session.endedAt ? new Date(session.endedAt).getTime() - new Date(session.startedAt).getTime() : Date.now() - new Date(session.startedAt).getTime();
-      return { ...session, duration, isLive: !session.endedAt };
-    });
-  });
-
-  app.get('/api/statistics/categories', { preHandler: requireAuth }, async (request) => {
-    const { account } = request as AuthenticatedRequest;
-    return getCategoryStats(account.id);
-  });
-
-  app.get('/api/statistics/followers', { preHandler: requireAuth }, async (request) => {
-    const { account } = request as AuthenticatedRequest;
-    const query = request.query as { limit?: string };
-    return getRecentFollowers(account.id, parseInt(query.limit || '10', 10));
-  });
-
-  app.get('/api/statistics/live', { preHandler: requireAuth }, async (request) => {
-    const { account } = request as AuthenticatedRequest;
-    const stats = getCurrentSessionStats(account.id);
-    if (!stats) return { isLive: false };
-    return { isLive: true, ...stats };
-  });
-
+  // ============================================
   // Clips API
+  // ============================================
+
   app.get('/api/clips/settings', { preHandler: requireAuth }, async (request) => {
     const { account } = request as AuthenticatedRequest;
     let settings = db.select().from(schema.clipSettings).where(eq(schema.clipSettings.accountId, account.id)).get();
-    if (!settings) return { id: null, enabled: false, defaultDuration: 30, maxDuration: 120, minUserLevel: 'everyone', cooldownSeconds: 30, discordGuildId: null, discordChannelId: null };
+    if (!settings) {
+      // Return defaults if no settings exist
+      return {
+        id: null,
+        enabled: false,
+        defaultDuration: 30,
+        maxDuration: 120,
+        minUserLevel: 'everyone',
+        cooldownSeconds: 30,
+        discordGuildId: null,
+        discordChannelId: null,
+      };
+    }
     return settings;
   });
 
   app.patch('/api/clips/settings', { preHandler: requireAuth }, async (request) => {
     const { account } = request as AuthenticatedRequest;
-    const body = request.body as { enabled?: boolean; defaultDuration?: number; maxDuration?: number; minUserLevel?: string; cooldownSeconds?: number; discordGuildId?: string | null; discordChannelId?: string | null };
+    const body = request.body as {
+      enabled?: boolean;
+      defaultDuration?: number;
+      maxDuration?: number;
+      minUserLevel?: string;
+      cooldownSeconds?: number;
+      discordGuildId?: string | null;
+      discordChannelId?: string | null;
+    };
+
     let existing = db.select().from(schema.clipSettings).where(eq(schema.clipSettings.accountId, account.id)).get();
+
     if (existing) {
-      db.update(schema.clipSettings).set({ enabled: body.enabled ?? existing.enabled, defaultDuration: body.defaultDuration ?? existing.defaultDuration, maxDuration: body.maxDuration ?? existing.maxDuration, minUserLevel: body.minUserLevel ?? existing.minUserLevel, cooldownSeconds: body.cooldownSeconds ?? existing.cooldownSeconds, discordGuildId: body.discordGuildId !== undefined ? body.discordGuildId : existing.discordGuildId, discordChannelId: body.discordChannelId !== undefined ? body.discordChannelId : existing.discordChannelId, updatedAt: new Date() }).where(eq(schema.clipSettings.accountId, account.id)).run();
+      db.update(schema.clipSettings)
+        .set({
+          enabled: body.enabled ?? existing.enabled,
+          defaultDuration: body.defaultDuration ?? existing.defaultDuration,
+          maxDuration: body.maxDuration ?? existing.maxDuration,
+          minUserLevel: body.minUserLevel ?? existing.minUserLevel,
+          cooldownSeconds: body.cooldownSeconds ?? existing.cooldownSeconds,
+          discordGuildId: body.discordGuildId !== undefined ? body.discordGuildId : existing.discordGuildId,
+          discordChannelId: body.discordChannelId !== undefined ? body.discordChannelId : existing.discordChannelId,
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.clipSettings.accountId, account.id))
+        .run();
     } else {
-      db.insert(schema.clipSettings).values({ accountId: account.id, enabled: body.enabled ?? false, defaultDuration: body.defaultDuration ?? 30, maxDuration: body.maxDuration ?? 120, minUserLevel: body.minUserLevel ?? 'everyone', cooldownSeconds: body.cooldownSeconds ?? 30, discordGuildId: body.discordGuildId ?? null, discordChannelId: body.discordChannelId ?? null }).run();
+      db.insert(schema.clipSettings)
+        .values({
+          accountId: account.id,
+          enabled: body.enabled ?? false,
+          defaultDuration: body.defaultDuration ?? 30,
+          maxDuration: body.maxDuration ?? 120,
+          minUserLevel: body.minUserLevel ?? 'everyone',
+          cooldownSeconds: body.cooldownSeconds ?? 30,
+          discordGuildId: body.discordGuildId ?? null,
+          discordChannelId: body.discordChannelId ?? null,
+        })
+        .run();
     }
+
     return db.select().from(schema.clipSettings).where(eq(schema.clipSettings.accountId, account.id)).get();
   });
 
   app.get('/api/clips', { preHandler: requireAuth }, async (request) => {
     const { account } = request as AuthenticatedRequest;
     const query = request.query as { limit?: string };
-    return db.select().from(schema.clips).where(eq(schema.clips.accountId, account.id)).orderBy(desc(schema.clips.createdAt)).limit(parseInt(query.limit || '50', 10)).all();
+    const limit = parseInt(query.limit || '50', 10);
+    return db.select()
+      .from(schema.clips)
+      .where(eq(schema.clips.accountId, account.id))
+      .orderBy(desc(schema.clips.createdAt))
+      .limit(limit)
+      .all();
   });
 
   app.get('/api/clips/:id', { preHandler: requireAuth }, async (request, reply) => {
     const { account } = request as AuthenticatedRequest;
     const { id } = request.params as { id: string };
-    const clip = db.select().from(schema.clips).where(and(eq(schema.clips.id, parseInt(id, 10)), eq(schema.clips.accountId, account.id))).get();
+    const clip = db.select()
+      .from(schema.clips)
+      .where(and(eq(schema.clips.id, parseInt(id, 10)), eq(schema.clips.accountId, account.id)))
+      .get();
     if (!clip) return reply.code(404).send({ error: 'Clip not found' });
     return clip;
   });
@@ -708,14 +908,34 @@ export async function startServer() {
   app.delete('/api/clips/:id', { preHandler: requireAuth }, async (request, reply) => {
     const { account } = request as AuthenticatedRequest;
     const { id } = request.params as { id: string };
-    const clip = db.select().from(schema.clips).where(and(eq(schema.clips.id, parseInt(id, 10)), eq(schema.clips.accountId, account.id))).get();
+    
+    const clip = db.select()
+      .from(schema.clips)
+      .where(and(eq(schema.clips.id, parseInt(id, 10)), eq(schema.clips.accountId, account.id)))
+      .get();
+    
     if (!clip) return reply.code(404).send({ error: 'Clip not found' });
+    
+    // Delete the file
     const fs = await import('fs').then(m => m.promises);
-    try { await fs.unlink(clip.filepath); } catch (error) { log.warn({ error, filepath: clip.filepath }, 'Failed to delete clip file'); }
+    try {
+      await fs.unlink(clip.filepath);
+    } catch (error) {
+      log.warn({ error, filepath: clip.filepath }, 'Failed to delete clip file');
+    }
+    
+    // Delete from database
     db.delete(schema.clips).where(eq(schema.clips.id, parseInt(id, 10))).run();
+    
     return { success: true };
   });
 
+  // ============================================
+  // Statistics API
+  // ============================================
+  await registerStatisticsRoutes(app);
+
+  // Root
   app.get('/', async (request) => {
     const query = request.query as { auth?: string; bot_auth?: string };
     if (query.auth === 'success') return { message: 'Authentication successful!' };
