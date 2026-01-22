@@ -3,25 +3,41 @@ import { eq, desc, sql, and, isNotNull } from 'drizzle-orm';
 import { db, schema } from '../db/index.js';
 import { requireAuth, type AuthenticatedRequest } from '../auth/middleware.js';
 import { connectionManager } from '../connections/manager.js';
-import { kickApi } from '../kick/api.js';
 import { createChildLogger } from '../utils/logger.js';
 
 const log = createChildLogger('statistics');
+
+// Fetch channel data from Kick's unofficial v2 API (no auth required)
+async function getKickChannelData(channelSlug: string): Promise<any | null> {
+  try {
+    const response = await fetch(`https://kick.com/api/v2/channels/${channelSlug}`, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'KaoticBot/1.0',
+      },
+    });
+
+    if (!response.ok) {
+      log.warn({ status: response.status, channelSlug }, 'Kick v2 API request failed');
+      return null;
+    }
+
+    const data = await response.json();
+    return data;
+  } catch (error) {
+    log.error({ error, channelSlug }, 'Failed to fetch from Kick v2 API');
+    return null;
+  }
+}
 
 export async function registerStatisticsRoutes(app: FastifyInstance) {
   // Overview statistics
   app.get('/api/statistics/overview', { preHandler: requireAuth }, async (request) => {
     const { account } = request as AuthenticatedRequest;
 
-    log.info({ 
-      accountId: account.id,
-      channelSlug: account.kickChannelSlug,
-      channelId: account.kickChannelId,
-    }, 'Statistics overview requested');
-
-    // Check if currently live
+    // Check if currently live via connection manager
     const status = connectionManager.getStatus(account.id);
-    const isLive = status?.status === 'connected';
+    const botConnected = status?.status === 'connected';
 
     // Get current/active stream session (no endedAt means still live)
     const currentStream = db.select()
@@ -34,47 +50,28 @@ export async function registerStatisticsRoutes(app: FastifyInstance) {
       .limit(1)
       .get();
 
-    // Fetch real follower count from Kick API
+    // Fetch real data from Kick v2 API
     let followerCount = 0;
-    
-    log.info({ channelSlug: account.kickChannelSlug }, 'Attempting to fetch channel from Kick API');
-    
+    let isLive = false;
+    let liveStreamData = null;
+
     if (account.kickChannelSlug) {
-      try {
-        log.info({ channelSlug: account.kickChannelSlug }, 'Calling kickApi.getChannel...');
-        const channelData = await kickApi.getChannel(account.kickChannelSlug, account.accessToken);
+      const channelData = await getKickChannelData(account.kickChannelSlug);
+      
+      if (channelData) {
+        followerCount = channelData.followers_count || 0;
         
-        log.info({ 
-          channelSlug: account.kickChannelSlug, 
-          channelData: JSON.stringify(channelData),
-          hasData: !!channelData
-        }, 'Kick API getChannel response');
-        
-        if (channelData) {
-          // Log all keys to see what's available
-          log.info({ keys: Object.keys(channelData) }, 'Channel data keys');
-          
-          // Kick API returns follower count in different possible locations
-          followerCount = channelData.followers_count 
-            || channelData.followersCount 
-            || channelData.follower_count
-            || channelData.followers
-            || 0;
-          
-          log.info({ 
-            channelSlug: account.kickChannelSlug, 
-            followerCount,
-            raw_followers_count: channelData.followers_count,
-            raw_followersCount: channelData.followersCount,
-          }, 'Extracted follower count');
-        } else {
-          log.warn({ channelSlug: account.kickChannelSlug }, 'No channel data returned from Kick API');
+        // Check if actually streaming via Kick API
+        if (channelData.livestream) {
+          isLive = true;
+          liveStreamData = {
+            title: channelData.livestream.session_title || 'Untitled Stream',
+            category: channelData.livestream.categories?.[0]?.name || 'Unknown',
+            viewers: channelData.livestream.viewer_count || 0,
+            startedAt: channelData.livestream.created_at,
+          };
         }
-      } catch (error) {
-        log.error({ error, channelSlug: account.kickChannelSlug }, 'Failed to fetch channel from Kick API');
       }
-    } else {
-      log.warn({ accountId: account.id }, 'No channel slug available for account');
     }
 
     // Get total streams count
@@ -103,12 +100,12 @@ export async function registerStatisticsRoutes(app: FastifyInstance) {
 
     return {
       isLive,
-      currentStream: currentStream ? {
+      currentStream: liveStreamData || (currentStream ? {
         title: currentStream.title || 'Untitled Stream',
         category: currentStream.category || 'Unknown',
         viewers: currentStream.peakViewers || 0,
         startedAt: currentStream.startedAt?.toISOString(),
-      } : null,
+      } : null),
       followerCount,
       totalStreams,
       totalStreamTime,
@@ -211,43 +208,26 @@ export async function registerStatisticsRoutes(app: FastifyInstance) {
   app.get('/api/statistics/live', { preHandler: requireAuth }, async (request) => {
     const { account } = request as AuthenticatedRequest;
 
-    const status = connectionManager.getStatus(account.id);
-    if (!status || status.status !== 'connected') {
-      return { isLive: false };
+    // Check Kick API for live status
+    if (account.kickChannelSlug) {
+      const channelData = await getKickChannelData(account.kickChannelSlug);
+      
+      if (channelData?.livestream) {
+        const ls = channelData.livestream;
+        return {
+          isLive: true,
+          stats: {
+            title: ls.session_title || 'Untitled Stream',
+            category: ls.categories?.[0]?.name || 'Unknown',
+            viewers: ls.viewer_count || 0,
+            duration: ls.duration || 0,
+            startedAt: ls.created_at,
+          },
+        };
+      }
     }
 
-    const currentStream = db.select()
-      .from(schema.streamSessions)
-      .where(and(
-        eq(schema.streamSessions.accountId, account.id),
-        sql`${schema.streamSessions.endedAt} IS NULL`
-      ))
-      .orderBy(desc(schema.streamSessions.startedAt))
-      .limit(1)
-      .get();
-
-    if (!currentStream) {
-      return { isLive: true, stats: null };
-    }
-
-    const now = new Date();
-    const duration = currentStream.startedAt 
-      ? Math.floor((now.getTime() - currentStream.startedAt.getTime()) / 1000)
-      : 0;
-
-    return {
-      isLive: true,
-      stats: {
-        title: currentStream.title || 'Untitled Stream',
-        category: currentStream.category || 'Unknown',
-        duration,
-        peakViewers: currentStream.peakViewers || 0,
-        totalMessages: currentStream.totalMessages || 0,
-        uniqueChatters: currentStream.uniqueChatters || 0,
-        newFollowers: currentStream.newFollowers || 0,
-        startedAt: currentStream.startedAt?.toISOString(),
-      },
-    };
+    return { isLive: false };
   });
 
   log.info('Statistics routes registered');
