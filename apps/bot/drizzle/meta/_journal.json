@@ -1,0 +1,20 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1768729846908,
+      "tag": "0000_living_black_queen",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1768771397431,
+      "tag": "0001_icy_shadow_king",
+      "breakpoints": true
+    }
+  ]
+}

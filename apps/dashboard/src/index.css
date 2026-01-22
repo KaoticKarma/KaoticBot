@@ -1,0 +1,31 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-kick-dark text-white;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-kick-bg p-6 rounded-lg border border-kick-border;
+  }
+  
+  .btn {
+    @apply px-4 py-2 rounded-lg font-medium transition-all;
+  }
+  
+  .btn-primary {
+    @apply bg-kick-green text-black hover:bg-kick-green/90;
+  }
+  
+  .btn-secondary {
+    @apply bg-kick-light text-white hover:bg-kick-light/80;
+  }
+  
+  .input {
+    @apply w-full bg-kick-light border border-kick-border rounded-lg px-4 py-2 text-white;
+  }
+}

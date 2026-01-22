@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stream Alerts</title>
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&family=Bebas+Neue&family=Montserrat:wght@400;700&family=Oswald:wght@400;700&family=Raleway:wght@400;700&family=Open+Sans:wght@400;700&family=Roboto:wght@400;700&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Impact', sans-serif; overflow: hidden; background: transparent; width: 100vw; height: 100vh; }
+    #alert-container { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; pointer-events: none; }
+    .alert { display: none; width: 100vw; height: 100vh; text-align: center; position: relative; }
+    .alert.show { display: flex; }
+
+    /* Layouts */
+    .alert.layout-above { flex-direction: column; align-items: center; justify-content: center; }
+    .alert.layout-side { flex-direction: row; align-items: center; justify-content: center; gap: 2vw; }
+    .alert.layout-overlay { position: relative; align-items: center; justify-content: center; }
+    .alert.layout-overlay .alert-text { position: absolute; width: 100%; text-align: center; }
+
+    /* Animations */
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes fadeOut { from { opacity: 1; } to { opacity: 0; } }
+    @keyframes slideIn { from { opacity: 0; transform: translateY(-100px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes slideOut { from { opacity: 1; transform: translateY(0); } to { opacity: 0; transform: translateY(100px); } }
+    @keyframes bounceIn { 0% { opacity: 0; transform: scale(0.3); } 50% { transform: scale(1.1); } 70% { transform: scale(0.9); } 100% { opacity: 1; transform: scale(1); } }
+    @keyframes bounceOut { 0% { transform: scale(1); } 30% { transform: scale(1.1); } 100% { opacity: 0; transform: scale(0.3); } }
+    @keyframes zoomIn { from { opacity: 0; transform: scale(0.5); } to { opacity: 1; transform: scale(1); } }
+    @keyframes zoomOut { from { opacity: 1; transform: scale(1); } to { opacity: 0; transform: scale(0.5); } }
+
+    .alert.anim-fade.show { animation: fadeIn 0.5s ease-out; }
+    .alert.anim-fade.hide { animation: fadeOut 0.5s ease-in; }
+    .alert.anim-slide.show { animation: slideIn 0.5s ease-out; }
+    .alert.anim-slide.hide { animation: slideOut 0.5s ease-in; }
+    .alert.anim-bounce.show { animation: bounceIn 0.6s ease-out; }
+    .alert.anim-bounce.hide { animation: bounceOut 0.4s ease-in; }
+    .alert.anim-zoom.show { animation: zoomIn 0.4s ease-out; }
+    .alert.anim-zoom.hide { animation: zoomOut 0.4s ease-in; }
+    .alert.anim-none.show { animation: none; }
+    .alert.anim-none.hide { animation: none; opacity: 0; }
+
+    /* Media fills entire viewport */
+    .alert-image, .alert-video { 
+      width: 100vw; 
+      height: 100vh; 
+      object-fit: contain;
+      border-radius: 0; 
+    }
+    
+    /* Text scales with viewport - position controlled via transform */
+    .alert-text { 
+      position: absolute;
+      left: 0;
+      right: 0;
+      font-weight: bold; 
+      font-size: clamp(24px, 5vw, 96px); 
+      text-shadow: 0 0 10px rgba(0,0,0,0.8), 0 0 20px rgba(0,0,0,0.6), 3px 3px 6px rgba(0,0,0,1); 
+      padding: 1vh 2vw; 
+    }
+
+    #custom-alert-container { display: none; width: 100%; height: 100%; align-items: center; justify-content: center; }
+    #custom-alert-container.show { display: flex; }
+  </style>
+  <style id="custom-styles"></style>
+</head>
+<body>
+  <div id="alert-container">
+    <div id="default-alert" class="alert"></div>
+    <div id="custom-alert-container"></div>
+  </div>
+  <audio id="alert-sound"></audio>
+
+  <script>
+    const API_URL = window.location.origin;
+    let currentAlertTimeout = null;
+
+    function connectToAlerts() {
+      console.log('[Overlay] Connecting to alert stream...');
+      console.log('[Overlay] API URL:', API_URL);
+      
+      // Check if we have a token in the URL
+      const urlParams = new URLSearchParams(window.location.search);
+      const token = urlParams.get('token');
+      const streamUrl = token 
+        ? `${API_URL}/api/alerts/stream?token=${token}`
+        : `${API_URL}/api/alerts/stream`;
+      
+      console.log('[Overlay] Stream URL:', streamUrl);
+      console.log('[Overlay] Token:', token ? 'present' : 'none');
+      
+      const eventSource = new EventSource(streamUrl);
+      
+      eventSource.addEventListener('alert', (event) => {
+        const alert = JSON.parse(event.data);
+        console.log('[Overlay] Received alert:', alert);
+        console.log('[Overlay] Alert media - Video:', alert.videoUrl, 'Image:', alert.imageUrl, 'Sound:', alert.sound);
+        showAlert(alert);
+      });
+
+      eventSource.addEventListener('skip', () => {
+        console.log('[Overlay] Alert skipped');
+        hideCurrentAlert();
+      });
+
+      eventSource.onopen = () => {
+        console.log('[Overlay] Connected to alert stream');
+      };
+
+      eventSource.onerror = (error) => {
+        console.error('[Overlay] EventSource error:', error);
+        eventSource.close();
+        console.log('[Overlay] Reconnecting in 5 seconds...');
+        setTimeout(connectToAlerts, 5000);
+      };
+    }
+
+    function replaceVariables(str, variables) {
+      if (!str || !variables) return str || '';
+      return str.replace(/\{name\}/g, variables.name || '').replace(/\{text\}/g, variables.text || '').replace(/\{sound\}/g, variables.sound || '').replace(/\{image\}/g, variables.image || '').replace(/\{amount\}/g, variables.amount || '').replace(/\{message\}/g, variables.message || '');
+    }
+
+    function showAlert(alert) {
+      console.log('[Overlay] showAlert called');
+      if (currentAlertTimeout) { clearTimeout(currentAlertTimeout); currentAlertTimeout = null; }
+      if (alert.customCodeEnabled && (alert.customHtml || alert.customCss || alert.customJs)) {
+        console.log('[Overlay] Using custom code alert');
+        showCustomAlert(alert);
+      } else {
+        console.log('[Overlay] Using default alert');
+        showDefaultAlert(alert);
+      }
+    }
+
+    function showDefaultAlert(alert) {
+      console.log('[Overlay] showDefaultAlert - Full alert object:', JSON.stringify(alert, null, 2));
+      console.log('[Overlay] showDefaultAlert - videoUrl:', alert.videoUrl, 'imageUrl:', alert.imageUrl);
+      
+      const customContainer = document.getElementById('custom-alert-container');
+      customContainer.classList.remove('show');
+      customContainer.innerHTML = '';
+
+      const container = document.getElementById('default-alert');
+      container.innerHTML = '';
+      
+      const layout = alert.layout || 'above';
+      const animation = alert.animation || 'fade';
+      container.className = `alert layout-${layout} anim-${animation}`;
+
+      // Add video or image
+      if (alert.videoUrl) {
+        console.log('[Overlay] Creating video element with src:', alert.videoUrl);
+        const video = document.createElement('video');
+        video.className = 'alert-video';
+        video.src = alert.videoUrl;
+        video.autoplay = true;
+        video.muted = true; // Start muted to allow autoplay in OBS
+        video.playsInline = true;
+        video.loop = false;
+        
+        video.onloadeddata = () => {
+          console.log('[Overlay] Video loaded successfully, attempting to play...');
+          // Unmute after a brief delay and set volume
+          setTimeout(() => {
+            video.muted = false;
+            video.volume = (alert.volume || 50) / 100;
+            console.log('[Overlay] Video unmuted, volume:', video.volume);
+          }, 100);
+        };
+        video.onerror = (e) => console.error('[Overlay] Video error:', e, video.error);
+        video.onplay = () => console.log('[Overlay] Video started playing');
+        
+        container.appendChild(video);
+        
+        // Force play attempt
+        video.play().then(() => {
+          console.log('[Overlay] Video play() succeeded');
+        }).catch(err => {
+          console.error('[Overlay] Video play() failed:', err);
+          // Try playing muted as fallback
+          video.muted = true;
+          video.play().catch(e => console.error('[Overlay] Muted play also failed:', e));
+        });
+        
+      } else if (alert.imageUrl) {
+        console.log('[Overlay] Creating image element with src:', alert.imageUrl);
+        const img = document.createElement('img');
+        img.className = 'alert-image';
+        img.src = alert.imageUrl;
+        img.alt = 'Alert';
+        img.onload = () => console.log('[Overlay] Image loaded successfully');
+        img.onerror = (e) => console.error('[Overlay] Image error:', e);
+        container.appendChild(img);
+      } else {
+        console.log('[Overlay] No video or image URL provided');
+      }
+
+      // Add message with styling
+      const message = document.createElement('div');
+      message.className = 'alert-text';
+      message.textContent = alert.customMessage || alert.message;
+      message.style.fontFamily = `'${alert.font || 'Impact'}', sans-serif`;
+      message.style.color = alert.topTextColor || '#ffffff';
+      
+      // Position text - convert pixel offset to viewport percentage
+      // Positive values = higher on screen, negative = lower
+      // Default to bottom 10% of screen
+      const positionPercent = (alert.textPositionY || 0) / 10; // Convert px to roughly vh
+      message.style.bottom = `${10 - positionPercent}%`;
+      
+      // Apply gradient if two colors differ
+      if (alert.topTextColor !== alert.bottomTextColor && alert.bottomTextColor) {
+        message.style.background = `linear-gradient(180deg, ${alert.topTextColor}, ${alert.bottomTextColor})`;
+        message.style.webkitBackgroundClip = 'text';
+        message.style.webkitTextFillColor = 'transparent';
+        message.style.backgroundClip = 'text';
+      }
+      
+      container.appendChild(message);
+      
+      // Debug: log what's in the container
+      console.log('[Overlay] Container innerHTML:', container.innerHTML);
+      console.log('[Overlay] Container children count:', container.children.length);
+
+      // Play sound
+      if (alert.sound) {
+        console.log('[Overlay] Playing sound:', alert.sound);
+        playSound(alert.sound, alert.volume || 50);
+      }
+
+      container.classList.add('show');
+      console.log('[Overlay] Alert shown, duration:', alert.duration, 'ms');
+      currentAlertTimeout = setTimeout(() => hideCurrentAlert(), alert.duration);
+    }
+
+    function showCustomAlert(alert) {
+      const defaultAlert = document.getElementById('default-alert');
+      defaultAlert.classList.remove('show');
+      defaultAlert.innerHTML = '';
+
+      const customContainer = document.getElementById('custom-alert-container');
+      const customStyles = document.getElementById('custom-styles');
+
+      const variables = alert.variables || {
+        name: alert.username || '',
+        text: alert.customMessage || alert.message || '',
+        sound: alert.sound || '',
+        image: alert.imageUrl || '',
+        amount: String(alert.amount || ''),
+        message: alert.message || '',
+      };
+
+      customStyles.textContent = alert.customCss ? replaceVariables(alert.customCss, variables) : '';
+      customContainer.innerHTML = alert.customHtml ? replaceVariables(alert.customHtml, variables) : '';
+      customContainer.classList.add('show');
+
+      if (alert.sound && !alert.customJs?.includes('new Audio')) {
+        playSound(alert.sound, alert.volume || 50);
+      }
+
+      if (alert.customJs) {
+        try {
+          const customFunction = new Function('name', 'text', 'sound', 'image', 'amount', 'message', 'container', alert.customJs);
+          customFunction(variables.name, variables.text, variables.sound, variables.image, variables.amount, variables.message, customContainer);
+        } catch (error) { console.error('[Overlay] Error executing custom JavaScript:', error); }
+      }
+
+      currentAlertTimeout = setTimeout(() => hideCurrentAlert(), alert.duration);
+    }
+
+    function playSound(soundUrl, volume) {
+      console.log('[Overlay] playSound called with:', soundUrl, 'volume:', volume);
+      const audio = document.getElementById('alert-sound');
+      audio.src = soundUrl;
+      audio.volume = Math.max(0, Math.min(1, volume / 100));
+      audio.play().catch(err => console.error('[Overlay] Error playing sound:', err));
+    }
+
+    function hideCurrentAlert() {
+      console.log('[Overlay] Hiding current alert');
+      if (currentAlertTimeout) { clearTimeout(currentAlertTimeout); currentAlertTimeout = null; }
+
+      const defaultAlert = document.getElementById('default-alert');
+      if (defaultAlert.classList.contains('show')) {
+        defaultAlert.classList.remove('show');
+        defaultAlert.classList.add('hide');
+        setTimeout(() => { defaultAlert.classList.remove('hide'); defaultAlert.innerHTML = ''; }, 500);
+      }
+
+      const customContainer = document.getElementById('custom-alert-container');
+      if (customContainer.classList.contains('show')) {
+        customContainer.classList.remove('show');
+        setTimeout(() => { customContainer.innerHTML = ''; document.getElementById('custom-styles').textContent = ''; }, 500);
+      }
+    }
+
+    console.log('[Overlay] Starting alert overlay...');
+    connectToAlerts();
+  </script>
+</body>
+</html>
