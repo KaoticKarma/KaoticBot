@@ -4,29 +4,65 @@ import { db, schema } from '../db/index.js';
 import { requireAuth, type AuthenticatedRequest } from '../auth/middleware.js';
 import { connectionManager } from '../connections/manager.js';
 import { createChildLogger } from '../utils/logger.js';
+import puppeteer from 'puppeteer';
 
 const log = createChildLogger('statistics');
 
-// Fetch channel data from Kick's unofficial v2 API (no auth required)
-async function getKickChannelData(channelSlug: string): Promise<any | null> {
-  try {
-    const response = await fetch(`https://kick.com/api/v2/channels/${channelSlug}`, {
-      headers: {
-        'Accept': 'application/json',
-        'User-Agent': 'KaoticBot/1.0',
-      },
-    });
+// Cache for channel data to avoid hitting API too frequently
+const channelDataCache = new Map<string, { data: any; timestamp: number }>();
+const CACHE_TTL = 60000; // 1 minute cache
 
-    if (!response.ok) {
-      log.warn({ status: response.status, channelSlug }, 'Kick v2 API request failed');
+// Fetch channel data from Kick's v2 API using Puppeteer (bypasses Cloudflare)
+async function getKickChannelData(channelSlug: string): Promise<any | null> {
+  // Check cache first
+  const cached = channelDataCache.get(channelSlug);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+    log.debug({ channelSlug }, 'Using cached channel data');
+    return cached.data;
+  }
+
+  let browser = null;
+  try {
+    log.info({ channelSlug }, 'Fetching channel data via Puppeteer');
+    
+    browser = await puppeteer.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    });
+    
+    const page = await browser.newPage();
+    
+    // Set a realistic user agent
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    
+    // Navigate to the API endpoint
+    const response = await page.goto(`https://kick.com/api/v2/channels/${channelSlug}`, {
+      waitUntil: 'networkidle0',
+      timeout: 15000,
+    });
+    
+    if (!response || !response.ok()) {
+      log.warn({ channelSlug, status: response?.status() }, 'Failed to fetch channel data');
       return null;
     }
-
-    const data = await response.json();
+    
+    // Get the JSON response
+    const text = await page.evaluate(() => document.body.innerText);
+    const data = JSON.parse(text);
+    
+    // Cache the result
+    channelDataCache.set(channelSlug, { data, timestamp: Date.now() });
+    
+    log.info({ channelSlug, followersCount: data.followers_count }, 'Got channel data from Kick v2 API');
+    
     return data;
   } catch (error) {
-    log.error({ error, channelSlug }, 'Failed to fetch from Kick v2 API');
+    log.error({ error, channelSlug }, 'Failed to fetch from Kick v2 API via Puppeteer');
     return null;
+  } finally {
+    if (browser) {
+      await browser.close();
+    }
   }
 }
 
@@ -50,7 +86,7 @@ export async function registerStatisticsRoutes(app: FastifyInstance) {
       .limit(1)
       .get();
 
-    // Fetch real data from Kick v2 API
+    // Fetch real data from Kick v2 API via Puppeteer
     let followerCount = 0;
     let isLive = false;
     let liveStreamData = null;
@@ -72,6 +108,17 @@ export async function registerStatisticsRoutes(app: FastifyInstance) {
           };
         }
       }
+    }
+
+    // Fallback to bot connection status if API call didn't show live
+    if (!isLive && botConnected && currentStream) {
+      isLive = true;
+      liveStreamData = {
+        title: currentStream.title || 'Untitled Stream',
+        category: currentStream.category || 'Unknown',
+        viewers: currentStream.peakViewers || 0,
+        startedAt: currentStream.startedAt?.toISOString(),
+      };
     }
 
     // Get total streams count
@@ -100,12 +147,7 @@ export async function registerStatisticsRoutes(app: FastifyInstance) {
 
     return {
       isLive,
-      currentStream: liveStreamData || (currentStream ? {
-        title: currentStream.title || 'Untitled Stream',
-        category: currentStream.category || 'Unknown',
-        viewers: currentStream.peakViewers || 0,
-        startedAt: currentStream.startedAt?.toISOString(),
-      } : null),
+      currentStream: liveStreamData,
       followerCount,
       totalStreams,
       totalStreamTime,
