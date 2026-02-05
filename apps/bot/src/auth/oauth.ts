@@ -325,34 +325,76 @@ async function exchangeBotCode(code: string, verifier: string): Promise<boolean>
 
 /**
  * Refresh the bot account token
+ * ENHANCED with timeout and retry logic to prevent crashes
  */
-export async function refreshBotToken(): Promise<boolean> {
+export async function refreshBotToken(retryCount = 0): Promise<boolean> {
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY_MS = 2000 * Math.pow(2, retryCount); // 2s, 4s, 8s
+  
   const botConfig = db.select()
     .from(schema.botConfig)
     .get();
   
-  if (!botConfig || !botConfig.refreshToken) {
-    log.error('No bot refresh token available');
+  if (!botConfig) {
+    log.error('No bot configuration found');
+    return false;
+  }
+  
+  if (!botConfig.refreshToken) {
+    log.error('No bot refresh token available - bot needs re-authentication at /auth/bot/login');
     return false;
   }
   
   try {
-    log.info('Refreshing bot token...');
+    log.info({ 
+      attempt: retryCount + 1, 
+      maxRetries: MAX_RETRIES 
+    }, 'Refreshing bot token...');
+    
+    // Add timeout to fetch - prevents hanging forever
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
     
     const response = await fetch(KICK_TOKEN_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: { 
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'KaoticBot/1.0'
+      },
       body: new URLSearchParams({
         grant_type: 'refresh_token',
         client_id: config.KICK_CLIENT_ID,
         client_secret: config.KICK_CLIENT_SECRET,
         refresh_token: botConfig.refreshToken,
       }),
-    });
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timeoutId));
     
     if (!response.ok) {
-      const error = await response.text();
-      log.error({ status: response.status, error }, 'Bot token refresh failed');
+      const errorText = await response.text();
+      log.error({ 
+        status: response.status, 
+        statusText: response.statusText,
+        error: errorText,
+        attempt: retryCount + 1
+      }, 'Bot token refresh failed - Kick API returned error');
+      
+      // Retry on 5xx errors (server issues) or 429 (rate limit)
+      if ((response.status >= 500 || response.status === 429) && retryCount < MAX_RETRIES) {
+        log.info({ 
+          retryIn: RETRY_DELAY_MS,
+          attempt: retryCount + 1 
+        }, 'Retrying token refresh...');
+        
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+        return refreshBotToken(retryCount + 1);
+      }
+      
+      // If 401/400, refresh token is invalid - needs re-auth
+      if (response.status === 401 || response.status === 400) {
+        log.error('Bot refresh token is invalid - bot needs re-authentication at /auth/bot/login');
+      }
+      
       return false;
     }
     
@@ -361,6 +403,11 @@ export async function refreshBotToken(): Promise<boolean> {
       refresh_token?: string;
       expires_in: number;
     };
+    
+    if (!tokenData.access_token) {
+      log.error({ tokenData }, 'Invalid token response - missing access_token');
+      return false;
+    }
     
     const expiresAt = new Date(Date.now() + tokenData.expires_in * 1000);
     
@@ -374,11 +421,57 @@ export async function refreshBotToken(): Promise<boolean> {
       .where(eq(schema.botConfig.id, botConfig.id))
       .run();
     
-    log.info('Bot token refreshed successfully');
+    log.info({ 
+      expiresAt: expiresAt.toISOString(),
+      expiresInMinutes: Math.floor(tokenData.expires_in / 60),
+      retriesUsed: retryCount
+    }, '✅ Bot token refreshed successfully');
+    
     return true;
     
-  } catch (error) {
-    log.error({ error }, 'Error refreshing bot token');
+  } catch (error: any) {
+    // Better error logging with retry logic
+    if (error.name === 'AbortError') {
+      log.error({ attempt: retryCount + 1 }, 'Bot token refresh timed out after 10 seconds');
+      
+      // Retry on timeout
+      if (retryCount < MAX_RETRIES) {
+        log.info({ 
+          retryIn: RETRY_DELAY_MS,
+          attempt: retryCount + 1 
+        }, 'Retrying after timeout...');
+        
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+        return refreshBotToken(retryCount + 1);
+      }
+    } else if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED' || error.code === 'EAI_AGAIN') {
+      log.error({ 
+        errorCode: error.code,
+        errorMessage: error.message,
+        attempt: retryCount + 1
+      }, 'Network error during bot token refresh');
+      
+      // Retry on network errors
+      if (retryCount < MAX_RETRIES) {
+        log.info({ 
+          retryIn: RETRY_DELAY_MS,
+          attempt: retryCount + 1 
+        }, 'Retrying after network error...');
+        
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+        return refreshBotToken(retryCount + 1);
+      }
+    } else {
+      log.error({ 
+        errorName: error.name,
+        errorMessage: error.message,
+        errorCode: error.code,
+        errorStack: error.stack,
+        errorString: String(error),
+        attempt: retryCount + 1
+      }, 'Error refreshing bot token');
+    }
+    
     return false;
   }
 }
@@ -613,32 +706,78 @@ async function fetchChannelInfoFromPublicApi(slug: string): Promise<{
   }
 }
 
-export async function refreshAccountTokens(accountId: number): Promise<boolean> {
+export async function refreshAccountTokens(accountId: number, retryCount = 0): Promise<boolean> {
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY_MS = 2000 * Math.pow(2, retryCount); // 2s, 4s, 8s
+  
   const account = db.select()
     .from(schema.accounts)
     .where(eq(schema.accounts.id, accountId))
     .get();
   
-  if (!account || !account.refreshToken) {
-    log.error({ accountId }, 'No refresh token available');
+  if (!account) {
+    log.error({ accountId }, 'Account not found');
+    return false;
+  }
+  
+  if (!account.refreshToken) {
+    log.error({ accountId }, 'No refresh token available - account needs re-authentication');
     return false;
   }
   
   try {
+    log.info({ 
+      accountId,
+      attempt: retryCount + 1,
+      maxRetries: MAX_RETRIES
+    }, 'Refreshing account tokens...');
+    
+    // Add timeout to fetch
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+    
     const response = await fetch(KICK_TOKEN_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: { 
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'KaoticBot/1.0'
+      },
       body: new URLSearchParams({
         grant_type: 'refresh_token',
         client_id: config.KICK_CLIENT_ID,
         client_secret: config.KICK_CLIENT_SECRET,
         refresh_token: account.refreshToken,
       }),
-    });
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timeoutId));
     
     if (!response.ok) {
-      const error = await response.text();
-      log.error({ status: response.status, error, accountId }, 'Token refresh failed');
+      const errorText = await response.text();
+      log.error({ 
+        status: response.status, 
+        statusText: response.statusText,
+        error: errorText,
+        accountId,
+        attempt: retryCount + 1
+      }, 'Account token refresh failed - Kick API returned error');
+      
+      // Retry on 5xx errors (server issues) or 429 (rate limit)
+      if ((response.status >= 500 || response.status === 429) && retryCount < MAX_RETRIES) {
+        log.info({ 
+          retryIn: RETRY_DELAY_MS,
+          attempt: retryCount + 1,
+          accountId
+        }, 'Retrying token refresh...');
+        
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+        return refreshAccountTokens(accountId, retryCount + 1);
+      }
+      
+      // If 401/400, refresh token is invalid
+      if (response.status === 401 || response.status === 400) {
+        log.error({ accountId }, 'Account refresh token is invalid - needs re-authentication');
+      }
+      
       return false;
     }
     
@@ -647,6 +786,11 @@ export async function refreshAccountTokens(accountId: number): Promise<boolean> 
       refresh_token?: string;
       expires_in: number;
     };
+    
+    if (!tokenData.access_token) {
+      log.error({ tokenData, accountId }, 'Invalid token response - missing access_token');
+      return false;
+    }
     
     const expiresAt = new Date(Date.now() + tokenData.expires_in * 1000);
     
@@ -660,11 +804,62 @@ export async function refreshAccountTokens(accountId: number): Promise<boolean> 
       .where(eq(schema.accounts.id, accountId))
       .run();
     
-    log.info({ accountId }, 'Tokens refreshed successfully');
+    log.info({ 
+      accountId,
+      expiresAt: expiresAt.toISOString(),
+      expiresInMinutes: Math.floor(tokenData.expires_in / 60),
+      retriesUsed: retryCount
+    }, '✅ Account tokens refreshed successfully');
+    
     return true;
     
-  } catch (error) {
-    log.error({ error, accountId }, 'Error refreshing tokens');
+  } catch (error: any) {
+    // Better error logging with retry logic
+    if (error.name === 'AbortError') {
+      log.error({ accountId, attempt: retryCount + 1 }, 'Account token refresh timed out after 10 seconds');
+      
+      // Retry on timeout
+      if (retryCount < MAX_RETRIES) {
+        log.info({ 
+          retryIn: RETRY_DELAY_MS,
+          attempt: retryCount + 1,
+          accountId
+        }, 'Retrying after timeout...');
+        
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+        return refreshAccountTokens(accountId, retryCount + 1);
+      }
+    } else if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED' || error.code === 'EAI_AGAIN') {
+      log.error({ 
+        errorCode: error.code,
+        errorMessage: error.message,
+        accountId,
+        attempt: retryCount + 1
+      }, 'Network error during account token refresh');
+      
+      // Retry on network errors
+      if (retryCount < MAX_RETRIES) {
+        log.info({ 
+          retryIn: RETRY_DELAY_MS,
+          attempt: retryCount + 1,
+          accountId
+        }, 'Retrying after network error...');
+        
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+        return refreshAccountTokens(accountId, retryCount + 1);
+      }
+    } else {
+      log.error({ 
+        errorName: error.name,
+        errorMessage: error.message,
+        errorCode: error.code,
+        errorStack: error.stack,
+        errorString: String(error),
+        accountId,
+        attempt: retryCount + 1
+      }, 'Error refreshing account tokens');
+    }
+    
     return false;
   }
 }
