@@ -223,8 +223,10 @@ export class CommandHandler {
     try {
       const response = await parseVariables(command.response, varCtx);
       
-      // Send response - tag the user unless response already starts with @
-      const finalResponse = response.startsWith('@') ? response : `@${ctx.user.username} ${response}`;
+      // Send response - tag the user unless response already mentions them
+      const userMentioned = response.toLowerCase().startsWith(`@${ctx.user.username.toLowerCase()}`) ||
+                            response.toLowerCase().startsWith(ctx.user.username.toLowerCase());
+      const finalResponse = userMentioned ? (response.startsWith('@') ? response : `@${response}`) : `@${ctx.user.username} ${response}`;
       await sendMessage(finalResponse);
       
       // Set cooldown
