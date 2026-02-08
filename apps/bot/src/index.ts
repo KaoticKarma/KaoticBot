@@ -498,7 +498,7 @@ class KaoticBot {
       case 'top': {
         const leaderboard = await pointsService.getLeaderboard(5);
         if (leaderboard.length === 0) {
-          await sendReply('No one has any points yet!');
+          await sendReply(`@${username} No one has any points yet!`);
           return true;
         }
 
@@ -506,7 +506,7 @@ class KaoticBot {
           `#${i + 1} ${u.username}: ${u.points.toLocaleString()}`
         ).join(' | ');
 
-        await sendReply(`🏆 Top 5: ${entries}`);
+        await sendReply(`@${username} 🏆 Top 5: ${entries}`);
         return true;
       }
 
@@ -528,13 +528,13 @@ class KaoticBot {
       case 'queue':
       case 'q': {
         const list = queueService.list(accountId, 5);
-        await sendReply(list);
+        await sendReply(`@${username} ${list}`);
         return true;
       }
 
       case 'viewsr': {
         const fullList = queueService.list(accountId, 50);
-        await sendReply(fullList);
+        await sendReply(`@${username} ${fullList}`);
         return true;
       }
 
@@ -561,7 +561,7 @@ class KaoticBot {
           return true;
         }
         const msg = await queueService.setEnabled(accountId, true);
-        await sendReply('✅ Slot Requests are now OPEN! Use !sr + (Slot Name) to enter.');
+        await sendReply(`@${username} ✅ Slot Requests are now OPEN! Use !sr + (Slot Name) to enter.`);
         return true;
       }
 
@@ -571,7 +571,7 @@ class KaoticBot {
           return true;
         }
         const msg = await queueService.setEnabled(accountId, false);
-        await sendReply('🚫 Slot Requests are now CLOSED.');
+        await sendReply(`@${username} 🚫 Slot Requests are now CLOSED.`);
         return true;
       }
 
@@ -581,7 +581,7 @@ class KaoticBot {
           return true;
         }
         const msg = queueService.clear(accountId);
-        await sendReply(msg);
+        await sendReply(`@${username} ${msg}`);
         return true;
       }
 
@@ -591,7 +591,7 @@ class KaoticBot {
         const subCommand = args[0]?.toLowerCase();
 
         if (!subCommand) {
-          await sendReply(giveawayService.status(accountId));
+          await sendReply(`@${username} ${giveawayService.status(accountId)}`);
           return true;
         }
 
@@ -603,7 +603,7 @@ class KaoticBot {
             }
 
             if (args.length < 3) {
-              await sendReply(`Usage: !giveaway start <keyword> <prize> OR !giveaway start <keyword> <duration>m <prize>`);
+              await sendReply(`@${username} Usage: !giveaway start <keyword> <prize> OR !giveaway start <keyword> <duration>m <prize>`);
               return true;
             }
 
@@ -622,12 +622,12 @@ class KaoticBot {
 
             const prize = args.slice(prizeStart).join(' ');
             if (!prize) {
-              await sendReply(`Usage: !giveaway start <keyword> <prize>`);
+              await sendReply(`@${username} Usage: !giveaway start <keyword> <prize>`);
               return true;
             }
 
             const result = giveawayService.start(accountId, keyword, prize, username, duration);
-            await sendReply(result.message);
+            await sendReply(`@${username} ${result.message}`);
             return true;
           }
 
@@ -639,7 +639,7 @@ class KaoticBot {
             }
 
             const result = giveawayService.end(accountId);
-            await sendReply(result.message);
+            await sendReply(`@${username} ${result.message}`);
             return true;
           }
 
@@ -650,7 +650,7 @@ class KaoticBot {
             }
 
             const result = giveawayService.reroll(accountId);
-            await sendReply(result.message);
+            await sendReply(`@${username} ${result.message}`);
             return true;
           }
 
@@ -661,12 +661,12 @@ class KaoticBot {
             }
 
             const result = giveawayService.cancel(accountId);
-            await sendReply(result.message);
+            await sendReply(`@${username} ${result.message}`);
             return true;
           }
 
           default: {
-            await sendReply(giveawayService.status(accountId));
+            await sendReply(`@${username} ${giveawayService.status(accountId)}`);
             return true;
           }
         }

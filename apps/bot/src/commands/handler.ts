@@ -223,8 +223,9 @@ export class CommandHandler {
     try {
       const response = await parseVariables(command.response, varCtx);
       
-      // Send response - always tag the user who triggered the command
-      await sendMessage(`@${ctx.user.username} ${response}`);
+      // Send response - tag the user unless response already starts with @
+      const finalResponse = response.startsWith('@') ? response : `@${ctx.user.username} ${response}`;
+      await sendMessage(finalResponse);
       
       // Set cooldown
       this.setCooldown(name, ctx.user.id);
