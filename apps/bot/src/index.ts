@@ -12,6 +12,7 @@ import { eventMessagesService } from './events/service.js';
 import { firstTimeChatService } from './features/first-time-chat.js';
 import { queueService } from './features/queue.js';
 import { giveawayService } from './features/giveaway.js';
+import { extractBotMention, generateAIResponse, isAIEnabled } from './ai/service.js';
 import { initializeDiscordBot, shutdownDiscordBot } from './discord/service.js';
 import { createChildLogger } from './utils/logger.js';
 import { eq } from 'drizzle-orm';
@@ -306,6 +307,25 @@ class KaoticBot {
 
     // Check if it's a command
     if (!message.content.startsWith('!')) {
+      // Check for @bot mention for AI response
+      try {
+        const mentionMessage = extractBotMention(message.content);
+        if (mentionMessage && isAIEnabled(accountId)) {
+          const channelSlug = channel.slug || '';
+          const aiReply = await generateAIResponse(
+            accountId,
+            message.sender.id,
+            message.sender.username,
+            mentionMessage,
+            channelSlug
+          );
+          if (aiReply) {
+            await connectionManager.sendMessage(accountId, `@${message.sender.username} ${aiReply}`);
+          }
+        }
+      } catch (err) {
+        log.debug({ err }, 'AI mention response failed');
+      }
       return;
     }
 
