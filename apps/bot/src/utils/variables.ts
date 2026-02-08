@@ -1,7 +1,8 @@
 import type { VariableContext, VariableFunction } from '@kaoticbot/shared';
 import { db, schema } from '../db/index.js';
-import { eq, sql } from 'drizzle-orm';
+import { eq, sql, and } from 'drizzle-orm';
 import { createChildLogger } from './logger.js';
+import { getKickChannelData } from '../kick/channel-data.js';
 
 const log = createChildLogger('variables');
 
@@ -118,69 +119,116 @@ function parseVariableParts(inner: string): string[] {
 }
 
 // ============================================
+// Helper: fetch live channel data for stream variables
+// ============================================
+
+async function getLiveChannelData(ctx: VariableContext): Promise<any | null> {
+  // Get channel slug from the context
+  const slug = ctx.channel.slug || (ctx.channel as any).channelSlug;
+  if (!slug) return null;
+
+  try {
+    const data = await getKickChannelData(slug);
+    return data;
+  } catch (err) {
+    log.debug({ err }, 'Failed to fetch live channel data for variable');
+    return null;
+  }
+}
+
+// ============================================
 // Built-in Variable Handlers
 // ============================================
 
-// User variables - $(user) now includes @ for tagging
-registerVariable('user', (ctx) => `@${ctx.user.displayName}`);
+// User variables
+registerVariable('user', (ctx) => ctx.user.displayName);
 registerVariable('username', (ctx) => ctx.user.username);
 registerVariable('userid', (ctx) => ctx.user.id.toString());
 
-// User without @ prefix (if someone wants it without tagging)
+// User without @ prefix
 registerVariable('name', (ctx) => ctx.user.displayName);
 
 // Target user (for commands like !hug @someone)
-registerVariable('touser', (ctx) => {
-  if (ctx.touser) {
-    // Ensure @ prefix
-    const name = ctx.touser.replace(/^@/, '');
-    return `@${name}`;
-  }
-  return `@${ctx.user.displayName}`;
-});
-
+registerVariable('touser', (ctx) => ctx.touser || ctx.user.displayName);
 registerVariable('toname', (ctx) => {
   if (ctx.touser) {
-    // Remove @ if present and return lowercase
     return ctx.touser.replace(/^@/, '').toLowerCase();
   }
   return ctx.user.username;
 });
 
-// Random user from chat (with @ prefix)
+// Random user from chat
 registerVariable('randomuser', (ctx) => {
   if (ctx.chatUsers.length === 0) {
-    return `@${ctx.user.displayName}`;
+    return ctx.user.displayName;
   }
-  // Filter out the command sender for more interesting results
   const others = ctx.chatUsers.filter(u => u.toLowerCase() !== ctx.user.username.toLowerCase());
   if (others.length === 0) {
-    const randomUser = ctx.chatUsers[Math.floor(Math.random() * ctx.chatUsers.length)];
-    return `@${randomUser}`;
+    return ctx.chatUsers[Math.floor(Math.random() * ctx.chatUsers.length)];
   }
-  const randomUser = others[Math.floor(Math.random() * others.length)];
-  return `@${randomUser}`;
+  return others[Math.floor(Math.random() * others.length)];
 });
 
-// Channel info
-registerVariable('channel', (ctx) => ctx.channel.user?.username || 'Unknown');
-registerVariable('title', (ctx) => ctx.channel.livestream?.session_title || 'Offline');
-registerVariable('game', (ctx) => ctx.channel.livestream?.categories?.[0]?.name || 'No category');
-registerVariable('viewers', (ctx) => (ctx.channel.livestream?.viewer_count || 0).toString());
+// ============================================
+// Stream variables - fetch LIVE data from Kick API
+// ============================================
 
-// Stream status
-registerVariable('uptime', (ctx) => {
-  if (!ctx.channel.livestream?.start_time) {
+registerVariable('channel', (ctx) => {
+  return ctx.channel.slug || ctx.channel.user?.username || 'Unknown';
+});
+
+registerVariable('title', async (ctx) => {
+  const data = await getLiveChannelData(ctx);
+  if (data?.livestream?.session_title) {
+    return data.livestream.session_title;
+  }
+  return 'Offline';
+});
+
+registerVariable('game', async (ctx) => {
+  const data = await getLiveChannelData(ctx);
+  if (data?.livestream?.categories?.[0]?.name) {
+    return data.livestream.categories[0].name;
+  }
+  return 'No category';
+});
+
+registerVariable('viewers', async (ctx) => {
+  const data = await getLiveChannelData(ctx);
+  if (data?.livestream?.viewer_count !== undefined) {
+    return data.livestream.viewer_count.toString();
+  }
+  return '0';
+});
+
+registerVariable('followers', async (ctx) => {
+  const data = await getLiveChannelData(ctx);
+  if (data?.followers_count !== undefined) {
+    return data.followers_count.toString();
+  }
+  return '0';
+});
+
+registerVariable('uptime', async (ctx) => {
+  const data = await getLiveChannelData(ctx);
+
+  // Try created_at from livestream (v2 API field)
+  const startTimeStr = data?.livestream?.created_at || data?.livestream?.start_time;
+
+  if (!startTimeStr) {
     return 'Stream is offline';
   }
-  const start = new Date(ctx.channel.livestream.start_time);
+
+  const start = new Date(startTimeStr);
   const now = new Date();
   const diff = now.getTime() - start.getTime();
-  
+
+  if (diff < 0) return 'Stream is offline';
+
   const hours = Math.floor(diff / 3600000);
   const minutes = Math.floor((diff % 3600000) / 60000);
   const seconds = Math.floor((diff % 60000) / 1000);
-  
+
   if (hours > 0) {
     return `${hours}h ${minutes}m ${seconds}s`;
   } else if (minutes > 0) {
@@ -189,7 +237,65 @@ registerVariable('uptime', (ctx) => {
   return `${seconds}s`;
 });
 
+// ============================================
+// Followage - check local database
+// ============================================
+
+registerVariable('followage', async (ctx) => {
+  try {
+    // Look up the user in channelUsers table
+    const channelUser = db.select()
+      .from(schema.channelUsers)
+      .where(
+        and(
+          eq(schema.channelUsers.kickUserId, ctx.user.id),
+          eq(schema.channelUsers.isFollower, true)
+        )
+      )
+      .get();
+
+    if (channelUser?.followedAt) {
+      const followDate = new Date(channelUser.followedAt);
+      const now = new Date();
+      const diff = now.getTime() - followDate.getTime();
+
+      const days = Math.floor(diff / 86400000);
+      const months = Math.floor(days / 30);
+      const years = Math.floor(days / 365);
+
+      if (years > 0) {
+        const remainingMonths = Math.floor((days % 365) / 30);
+        return remainingMonths > 0
+          ? `${years} year${years > 1 ? 's' : ''}, ${remainingMonths} month${remainingMonths > 1 ? 's' : ''}`
+          : `${years} year${years > 1 ? 's' : ''}`;
+      } else if (months > 0) {
+        const remainingDays = days % 30;
+        return remainingDays > 0
+          ? `${months} month${months > 1 ? 's' : ''}, ${remainingDays} day${remainingDays > 1 ? 's' : ''}`
+          : `${months} month${months > 1 ? 's' : ''}`;
+      } else if (days > 0) {
+        return `${days} day${days > 1 ? 's' : ''}`;
+      } else {
+        return 'today';
+      }
+    }
+
+    // User found but no follow date recorded
+    if (channelUser) {
+      return 'Following (date unknown)';
+    }
+
+    return 'Not following';
+  } catch (err) {
+    log.debug({ err }, 'Followage lookup failed');
+    return 'Unknown';
+  }
+});
+
+// ============================================
 // Args handling
+// ============================================
+
 registerVariable('args', (ctx) => ctx.args.join(' ') || '');
 registerVariable('1', (ctx) => ctx.args[0] || '');
 registerVariable('2', (ctx) => ctx.args[1] || '');
@@ -203,7 +309,10 @@ registerVariable('random', (ctx, ...options) => {
   return options[Math.floor(Math.random() * options.length)];
 });
 
+// ============================================
 // Counter system
+// ============================================
+
 registerVariable('counter', async (ctx, counterName) => {
   if (!counterName) return '0';
   
@@ -215,13 +324,11 @@ registerVariable('counter', async (ctx, counterName) => {
   return (counter?.value || 0).toString();
 });
 
-// Counter increment: $(counter.add deaths 1)
 registerVariable('counter.add', async (ctx, counterName, amountStr = '1') => {
   if (!counterName) return '0';
   
   const amount = parseInt(amountStr, 10) || 1;
   
-  // Upsert counter
   db.run(sql`
     INSERT INTO counters (name, value) VALUES (${counterName}, ${amount})
     ON CONFLICT(name) DO UPDATE SET value = value + ${amount}
@@ -235,7 +342,6 @@ registerVariable('counter.add', async (ctx, counterName, amountStr = '1') => {
   return (counter?.value || 0).toString();
 });
 
-// Counter set: $(counter.set deaths 0)
 registerVariable('counter.set', async (ctx, counterName, valueStr = '0') => {
   if (!counterName) return '0';
   
@@ -249,7 +355,10 @@ registerVariable('counter.set', async (ctx, counterName, valueStr = '0') => {
   return value.toString();
 });
 
+// ============================================
 // Time variables
+// ============================================
+
 registerVariable('time', () => {
   return new Date().toLocaleTimeString('en-US', { 
     hour: '2-digit', 
@@ -267,13 +376,12 @@ registerVariable('date', () => {
   });
 });
 
-// Latency - returns the current latency in ms (number only)
+// ============================================
+// Misc variables
+// ============================================
+
 registerVariable('latency', () => `${currentLatency}`);
 
-// Followage placeholder (requires API call - will be implemented in command handler)
-registerVariable('followage', () => 'Unknown');
-
-// Command list
 registerVariable('commandlist', () => {
   const cmds = db.select({ name: schema.commands.name })
     .from(schema.commands)
