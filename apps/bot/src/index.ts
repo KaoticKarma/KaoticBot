@@ -28,7 +28,7 @@ const BUILT_IN_COMMANDS = [
   // Points commands
   'points', 'gamble', 'bet', 'give', 'leaderboard', 'top',
   // Queue commands
-  'join', 'sr', 'queue', 'q', 'removesr', 'nextsr', 'position', 'pos', 'startsr', 'closesr', 'clearsr',
+  'join', 'sr', 'queue', 'q', 'viewsr', 'removesr', 'nextsr', 'position', 'pos', 'startsr', 'closesr', 'clearsr',
   // Giveaway commands
   'giveaway', 'gw',
 ];
@@ -509,6 +509,12 @@ class KaoticBot {
       case 'q': {
         const list = queueService.list(accountId, 5);
         await sendReply(list);
+        return true;
+      }
+
+      case 'viewsr': {
+        const fullList = queueService.list(accountId, 50);
+        await sendReply(fullList);
         return true;
       }
 
