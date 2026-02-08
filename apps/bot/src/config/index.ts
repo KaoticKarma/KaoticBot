@@ -23,6 +23,9 @@ const envSchema = z.object({
   // TTS Monster
   TTS_MONSTER_API_KEY: z.string().default(''),
   
+  // Anthropic AI (for @mention chat responses)
+  ANTHROPIC_API_KEY: z.string().default(''),
+  
   // Channel config (required to avoid Cloudflare API blocking)
   KICK_CHANNEL_SLUG: z.string().min(1, 'KICK_CHANNEL_SLUG is required'),
   KICK_CHANNEL_ID: z.coerce.number({ required_error: 'KICK_CHANNEL_ID is required' }),

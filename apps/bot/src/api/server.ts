@@ -16,6 +16,7 @@ import { initializeTracker } from '../stats/tracker.js';
 import { registerStatisticsRoutes } from './statistics.js';
 import { connectionManager } from '../connections/manager.js';
 import { isDiscordReady, testDiscordConnection, getBotGuilds, getGuildChannels, getGuildRoles, getBotInviteUrl } from '../discord/service.js';
+import { isAIEnabled, setAIEnabled, getAIConfig } from '../ai/service.js';
 import { readFileSync, createWriteStream, existsSync, mkdirSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -934,7 +935,31 @@ export async function startServer() {
   // Statistics API
   // ============================================
   await registerStatisticsRoutes(app);
+  app.get('/api/ai/status', { preHandler: requireAuth }, async (request) => {
+    const { account } = request as AuthenticatedRequest;
+    return {
+      enabled: isAIEnabled(account.id),
+      configured: !!config.ANTHROPIC_API_KEY,
+      config: {
+        cooldownSeconds: getAIConfig().cooldownMs / 1000,
+        rateLimitPerMinute: getAIConfig().rateLimitPerMinute,
+        maxMessageLength: getAIConfig().maxMessageLength,
+      },
+    };
+  });
 
+  app.post('/api/ai/toggle', { preHandler: requireAuth }, async (request, reply) => {
+    const { account } = request as AuthenticatedRequest;
+    const { enabled } = request.body as { enabled: boolean };
+    if (typeof enabled !== 'boolean') {
+      return reply.code(400).send({ error: 'enabled must be a boolean' });
+    }
+    if (!config.ANTHROPIC_API_KEY) {
+      return reply.code(400).send({ error: 'ANTHROPIC_API_KEY not configured in .env' });
+    }
+    setAIEnabled(account.id, enabled);
+    return { success: true, enabled };
+  });
   // Root
   app.get('/', async (request) => {
     const query = request.query as { auth?: string; bot_auth?: string };
