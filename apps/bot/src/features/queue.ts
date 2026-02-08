@@ -8,7 +8,7 @@ interface QueueEntry {
   oderId: number;
   username: string;
   joinedAt: Date;
-  note?: string; // Optional note like gamertag
+  note?: string; // Slot name / gamertag
 }
 
 interface QueueSettings {
@@ -27,9 +27,9 @@ const defaultSettings: QueueSettings = {
   maxSize: 50,
   subPriority: false,
   allowRejoin: true,
-  joinMessage: '$(user) joined the queue at position #$(position)!',
+  joinMessage: '@$(user) joined the queue at position #$(position) with slot: $(note)',
   leaveMessage: '$(user) left the queue.',
-  nextMessage: '🎮 Next up: $(user)!',
+  nextMessage: '🎮 Next up: $(user) — Slot: $(note)!',
   emptyMessage: 'The queue is empty!',
 };
 
@@ -115,7 +115,12 @@ class QueueService {
     const settings = this.getSettings(accountId);
     
     if (!settings.enabled) {
-      return { success: false, message: 'The queue is currently closed.' };
+      return { success: false, message: '🚫 Slot Requests are currently closed.' };
+    }
+    
+    // Require a slot name
+    if (!note || note.trim() === '') {
+      return { success: false, message: `@${username} Please provide a slot name! Usage: !sr (Slot Name)` };
     }
     
     const queue = this.getQueue(accountId);
@@ -144,7 +149,7 @@ class QueueService {
       oderId,
       username,
       joinedAt: new Date(),
-      note,
+      note: note.trim(),
     };
     
     // Add to queue (sub priority or end)
@@ -159,19 +164,21 @@ class QueueService {
         queue.splice(firstNonSubIndex, 0, entry);
         position = firstNonSubIndex + 1;
       }
-      entry.note = `[SUB] ${note || ''}`.trim();
+      // Preserve original note but mark as sub internally
+      entry.note = `[SUB] ${entry.note}`;
     } else {
       queue.push(entry);
       position = queue.length;
     }
     
-    log.info({ accountId, username, position }, 'User joined queue');
+    log.info({ accountId, username, position, note: entry.note }, 'User joined queue');
     
     // Build message
     let message = settings.joinMessage;
     message = message.replace(/\$\(user\)/gi, `@${username}`);
     message = message.replace(/\$\(position\)/gi, position.toString());
     message = message.replace(/\$\(size\)/gi, queue.length.toString());
+    message = message.replace(/\$\(note\)/gi, note.trim());
     
     return { success: true, message, position };
   }
@@ -217,11 +224,14 @@ class QueueService {
     }
     pickedUsers.get(accountId)!.add(entry.oderId);
     
-    log.info({ accountId, username: entry.username }, 'User picked from queue');
+    log.info({ accountId, username: entry.username, note: entry.note }, 'User picked from queue');
+    
+    // Clean note (strip [SUB] prefix if present)
+    const cleanNote = entry.note?.replace(/^\[SUB\]\s*/, '') || '';
     
     let message = settings.nextMessage;
     message = message.replace(/\$\(user\)/gi, `@${entry.username}`);
-    message = message.replace(/\$\(note\)/gi, entry.note || '');
+    message = message.replace(/\$\(note\)/gi, cleanNote);
     message = message.replace(/\$\(remaining\)/gi, queue.length.toString());
     
     return { success: true, message, entry };
@@ -235,7 +245,7 @@ class QueueService {
     const index = queue.findIndex(e => e.oderId === oderId);
     
     if (index === -1) {
-      return `@${username} You're not in the queue! Use !join to enter.`;
+      return `@${username} You're not in the queue! Use !sr (Slot Name) to enter.`;
     }
     
     return `@${username} You're at position #${index + 1} of ${queue.length} in the queue.`;
@@ -248,11 +258,14 @@ class QueueService {
     const queue = this.getQueue(accountId);
     
     if (queue.length === 0) {
-      return 'The queue is empty! Use !join to enter.';
+      return 'The queue is empty! Use !sr (Slot Name) to enter.';
     }
     
     const shown = queue.slice(0, limit);
-    const entries = shown.map((e, i) => `#${i + 1} ${e.username}`).join(', ');
+    const entries = shown.map((e, i) => {
+      const cleanNote = e.note?.replace(/^\[SUB\]\s*/, '') || '';
+      return `#${i + 1} ${e.username}${cleanNote ? ` (${cleanNote})` : ''}`;
+    }).join(', ');
     
     if (queue.length > limit) {
       return `📋 Queue (${queue.length}): ${entries}... and ${queue.length - limit} more`;
@@ -282,7 +295,7 @@ class QueueService {
    */
   async setEnabled(accountId: number, enabled: boolean): Promise<string> {
     await this.updateSettings(accountId, { enabled });
-    return enabled ? '✅ Queue is now OPEN! Use !join to enter.' : '🚫 Queue is now CLOSED.';
+    return enabled ? '✅ Slot Requests are now OPEN! Use !sr (Slot Name) to enter.' : '🚫 Slot Requests are now CLOSED.';
   }
   
   /**

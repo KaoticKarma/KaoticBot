@@ -535,7 +535,7 @@ class KaoticBot {
           return true;
         }
         const msg = await queueService.setEnabled(accountId, true);
-        await sendReply(msg);
+        await sendReply('✅ Slot Requests are now OPEN! Use !sr + (Slot Name) to enter.');
         return true;
       }
 
@@ -545,7 +545,7 @@ class KaoticBot {
           return true;
         }
         const msg = await queueService.setEnabled(accountId, false);
-        await sendReply(msg);
+        await sendReply('🚫 Slot Requests are now CLOSED.');
         return true;
       }
 
