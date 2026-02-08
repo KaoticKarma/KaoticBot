@@ -31,8 +31,6 @@ export class CommandHandler {
   
   // Clear old users periodically
   cleanupChatUsers(chatroomId: number, maxAge = 30 * 60 * 1000): void {
-    // For simplicity, just clear and let it rebuild
-    // In production, you'd track timestamps per user
     chatUsers.set(chatroomId, new Set());
   }
   
@@ -208,8 +206,6 @@ export class CommandHandler {
     if (!ctx.user.isModerator && this.isOnCooldown(name, ctx.user.id, command.cooldown)) {
       const remaining = this.getRemainingCooldown(name, ctx.user.id, command.cooldown);
       log.debug({ command: name, remaining }, 'Command on cooldown');
-      // Optionally send cooldown message (commented out to reduce spam)
-      // await sendMessage(`@${ctx.user.displayName} Command is on cooldown. ${remaining}s remaining.`);
       return false;
     }
     
@@ -227,8 +223,8 @@ export class CommandHandler {
     try {
       const response = await parseVariables(command.response, varCtx);
       
-      // Send response
-      await sendMessage(response);
+      // Send response - always tag the user who triggered the command
+      await sendMessage(`@${ctx.user.username} ${response}`);
       
       // Set cooldown
       this.setCooldown(name, ctx.user.id);
