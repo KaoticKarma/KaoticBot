@@ -28,8 +28,8 @@ const defaultSettings: QueueSettings = {
   subPriority: false,
   allowRejoin: true,
   joinMessage: '@$(user) joined the queue at position #$(position) with slot: $(note)',
-  leaveMessage: '$(user) left the queue.',
-  nextMessage: '🎮 Next up: $(user) — Slot: $(note)!',
+  leaveMessage: '@$(user) left the queue.',
+  nextMessage: '🎮 Next up: @$(user) — Slot: $(note)!',
   emptyMessage: 'The queue is empty!',
 };
 
@@ -175,7 +175,7 @@ class QueueService {
     
     // Build message
     let message = settings.joinMessage;
-    message = message.replace(/\$\(user\)/gi, `@${username}`);
+    message = message.replace(/\$\(user\)/gi, username);
     message = message.replace(/\$\(position\)/gi, position.toString());
     message = message.replace(/\$\(size\)/gi, queue.length.toString());
     message = message.replace(/\$\(note\)/gi, note.trim());
@@ -200,7 +200,7 @@ class QueueService {
     log.info({ accountId, username }, 'User left queue');
     
     let message = settings.leaveMessage;
-    message = message.replace(/\$\(user\)/gi, `@${username}`);
+    message = message.replace(/\$\(user\)/gi, username);
     
     return { success: true, message };
   }
@@ -230,7 +230,7 @@ class QueueService {
     const cleanNote = entry.note?.replace(/^\[SUB\]\s*/, '') || '';
     
     let message = settings.nextMessage;
-    message = message.replace(/\$\(user\)/gi, `@${entry.username}`);
+    message = message.replace(/\$\(user\)/gi, entry.username);
     message = message.replace(/\$\(note\)/gi, cleanNote);
     message = message.replace(/\$\(remaining\)/gi, queue.length.toString());
     
