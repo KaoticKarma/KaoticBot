@@ -33,6 +33,7 @@ export interface StreamLiveData {
   viewerCount?: number;
   streamId?: string;
   thumbnailUrl?: string;
+  channelSlug?: string;
 }
 
 export async function onStreamLive(accountId: number, data: StreamLiveData): Promise<void> {
@@ -44,11 +45,21 @@ export async function onStreamLive(accountId: number, data: StreamLiveData): Pro
   }
   
   try {
+    // Fetch account info for channel name and slug
+    const account = db.select()
+      .from(schema.accounts)
+      .where(eq(schema.accounts.id, accountId))
+      .get();
+    
+    const channelSlug = data.channelSlug || account?.kickChannelSlug || account?.kickUsername || 'unknown';
+    const channelName = account?.kickUsername || account?.kickDisplayName || channelSlug;
+    const channelUrl = `https://kick.com/${channelSlug}`;
+
     await cleanupOldScreenshots();
     
     let screenshotPath: string | undefined;
     try {
-      screenshotPath = await captureStreamScreenshot();
+      screenshotPath = await captureStreamScreenshot(channelSlug);
     } catch (error) {
       log.warn({ error }, 'Failed to capture screenshot');
     }
@@ -94,10 +105,13 @@ export async function onStreamLive(accountId: number, data: StreamLiveData): Pro
     if (settings?.guildId && settings?.channelId && settings.goLiveEnabled) {
       try {
         const discordResult = await sendGoLiveNotification(settings, {
-          title: data.title,
-          category: data.category,
+          channelName,
+          channelUrl,
+          title: data.title || 'Live Stream',
+          category: data.category || 'Just Chatting',
           viewerCount: data.viewerCount,
           screenshotPath,
+          thumbnailUrl: account?.kickProfilePic || data.thumbnailUrl || undefined,
         });
         
         if (discordResult) {
@@ -108,6 +122,8 @@ export async function onStreamLive(accountId: number, data: StreamLiveData): Pro
             .set({ discordMessageId: discordResult.messageId, discordChannelId: discordResult.channelId })
             .where(eq(schema.streamSessions.id, sessionId))
             .run();
+          
+          log.info({ accountId, messageId: discordResult.messageId }, 'Discord go-live notification sent');
         }
       } catch (error) {
         log.error({ error, accountId }, 'Failed to send Discord notification');
@@ -155,11 +171,23 @@ export async function onStreamOffline(accountId: number): Promise<void> {
     
     if (settings?.guildId && settings?.channelId && settings.offlineEnabled && session.discordMessageId) {
       try {
+        // Fetch account info for channel name
+        const account = db.select()
+          .from(schema.accounts)
+          .where(eq(schema.accounts.id, accountId))
+          .get();
+        
+        const channelSlug = account?.kickChannelSlug || account?.kickUsername || 'unknown';
+        const channelName = account?.kickUsername || account?.kickDisplayName || channelSlug;
+        const channelUrl = `https://kick.com/${channelSlug}`;
+
         await sendOfflineNotification(settings, {
           messageId: session.discordMessageId,
+          channelId: session.discordChannelId || settings.channelId,
+          channelName,
+          channelUrl,
           duration,
           peakViewers: session.peakViewers,
-          avgViewers,
           totalMessages: session.totalMessages,
           uniqueChatters: session.uniqueChatters.size,
           newFollowers: session.newFollowers,

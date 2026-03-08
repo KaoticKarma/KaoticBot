@@ -14,6 +14,7 @@ import { queueService } from './features/queue.js';
 import { giveawayService } from './features/giveaway.js';
 import { extractBotMention, generateAIResponse, isAIEnabled } from './ai/service.js';
 import { initializeDiscordBot, shutdownDiscordBot } from './discord/service.js';
+import { onStreamLive, onStreamOffline, onChatMessage, onNewFollower, onNewSub, onGiftedSub, onViewerCountUpdate, isStreamLive } from './stats/tracker.js';
 import { createChildLogger } from './utils/logger.js';
 import { eq } from 'drizzle-orm';
 import type { KickChatMessage, KickChannel } from '@kaoticbot/shared';
@@ -22,6 +23,9 @@ const log = createChildLogger('main');
 
 // Timer managers per account
 const timerManagers = new Map<number, TimerManager>();
+
+// Stream status polling interval per account
+let streamPollInterval: ReturnType<typeof setInterval> | null = null;
 
 // Built-in command names (these skip database lookup)
 const BUILT_IN_COMMANDS = [
@@ -79,6 +83,9 @@ class KaoticBot {
 
     this.isRunning = true;
     log.info('KaoticBot is now running!');
+
+    // Start polling Kick API for stream status (Pusher events unreliable)
+    this.startStreamPolling();
   }
 
   /**
@@ -138,6 +145,7 @@ class KaoticBot {
       const username = data.username || data.subscriber?.username || 'Unknown';
       const months = data.months || 1;
       alertsManager.triggerSubscription(username, months);
+      onNewSub(accountId);
 
       const chatMsg = eventMessagesService.getSubscriptionMessage(accountId, username);
       if (chatMsg) {
@@ -151,6 +159,7 @@ class KaoticBot {
       const count = data.gifted_usernames?.length || data.count || 1;
       const recipient = data.gifted_usernames?.[0];
       alertsManager.triggerGiftedSub(recipient || 'someone', gifter, count);
+      onGiftedSub(accountId, count);
 
       const chatMsg = eventMessagesService.getGiftedSubMessage(accountId, gifter, count, recipient);
       if (chatMsg) {
@@ -161,7 +170,9 @@ class KaoticBot {
     connectionManager.onEvent(accountId, 'follow', async (data: any) => {
       log.info({ data }, '💚 Follow event');
       const username = data.username || data.follower?.username || 'Unknown';
+      const userId = data.user_id || data.follower?.id || 0;
       alertsManager.triggerFollow(username);
+      onNewFollower(accountId, username, userId);
 
       const chatMsg = eventMessagesService.getFollowMessage(accountId, username);
       if (chatMsg) {
@@ -193,6 +204,29 @@ class KaoticBot {
       }
     });
 
+    // ── Stream start/end events (Pusher - may not fire on all channels) ──
+    connectionManager.onEvent(accountId, 'stream_start', async (data: any) => {
+      log.info({ data, accountId }, '🔴 Stream started (Pusher event)');
+      if (!isStreamLive(accountId)) {
+        const channelSlug = account.kickChannelSlug || account.kickUsername || 'unknown';
+        await onStreamLive(accountId, {
+          title: data.title || data.livestream?.session_title || 'Live Stream',
+          category: data.category?.name || data.livestream?.categories?.[0]?.name || 'Just Chatting',
+          viewerCount: data.viewer_count || 0,
+          streamId: data.id || data.livestream?.id?.toString(),
+          thumbnailUrl: data.thumbnail?.url,
+          channelSlug,
+        });
+      }
+    });
+
+    connectionManager.onEvent(accountId, 'stream_end', async (data: any) => {
+      log.info({ data, accountId }, '⚫ Stream ended (Pusher event)');
+      if (isStreamLive(accountId)) {
+        await onStreamOffline(accountId);
+      }
+    });
+
     // Create timer manager for this account
     const timerManager = new TimerManager(
       account.kickChatroomId!,
@@ -204,6 +238,116 @@ class KaoticBot {
     timerManager.start();
 
     log.info({ accountId, channelSlug: account.kickChannelSlug }, 'Account handlers set up');
+  }
+
+  /**
+   * Poll Kick API for stream status changes (backup for unreliable Pusher events)
+   * Checks every 60 seconds if any connected account went live or offline
+   */
+  private startStreamPolling(): void {
+    if (streamPollInterval) return;
+
+    log.info('Starting stream status polling (every 60s)');
+
+    const pollStreamStatus = async () => {
+      try {
+        const statuses = connectionManager.getAllStatuses();
+        for (const status of statuses) {
+          if (status.status !== 'connected') continue;
+
+          const account = db.select()
+            .from(schema.accounts)
+            .where(eq(schema.accounts.id, status.accountId))
+            .get();
+
+          if (!account?.kickChannelSlug || !account.kickUserId) continue;
+
+          const accountId = status.accountId;
+          const channelSlug = account.kickChannelSlug;
+          const wasLive = isStreamLive(accountId);
+
+          try {
+            // Use Kick Official API: GET /channels?broadcaster_user_id=
+            const token = (account as any).accessToken || (account as any).access_token;
+            if (!token) {
+              log.warn({ accountId }, 'No access token for stream poll');
+              continue;
+            }
+
+            const response = await fetch(
+              `https://api.kick.com/public/v1/channels?broadcaster_user_id=${account.kickUserId}`,
+              {
+                headers: {
+                  'Authorization': `Bearer ${token}`,
+                  'Accept': 'application/json',
+                },
+              }
+            );
+
+            if (!response.ok) {
+              log.warn({ accountId, status: response.status }, 'Stream poll API request failed');
+              continue;
+            }
+
+            const result = await response.json() as any;
+            const channelInfo = result.data?.[0] || result.data;
+
+            if (!channelInfo) {
+              log.warn({ accountId }, 'No channel data in poll response');
+              continue;
+            }
+
+            const stream = channelInfo.stream;
+            const nowLive = !!(stream && stream.is_live === true);
+            const streamTitle = channelInfo.stream_title || stream?.title || 'Live Stream';
+            const categoryName = channelInfo.category?.name || 'Just Chatting';
+            const viewerCount = stream?.viewer_count || 0;
+            const thumbnailUrl = stream?.thumbnail || undefined;
+
+            log.info({ accountId, channelSlug, nowLive, wasLive, viewerCount }, '📊 Stream poll check');
+
+            if (nowLive && !wasLive) {
+              // Transition: offline -> live
+              log.info({ accountId, channelSlug }, '🔴 Stream detected as LIVE via API poll');
+              await onStreamLive(accountId, {
+                title: streamTitle,
+                category: categoryName,
+                viewerCount,
+                thumbnailUrl,
+                channelSlug,
+              });
+            } else if (nowLive && wasLive) {
+              // Still live — update viewer count for peak tracking
+              if (viewerCount > 0) {
+                onViewerCountUpdate(accountId, viewerCount);
+              }
+            } else if (!nowLive && wasLive) {
+              // Transition: live -> offline
+              log.info({ accountId, channelSlug }, '⚫ Stream detected as OFFLINE via API poll');
+              await onStreamOffline(accountId);
+            }
+          } catch (err) {
+            log.warn({ err, accountId }, 'Stream poll check failed for account');
+          }
+        }
+      } catch (err) {
+        log.error({ err }, 'Stream status polling error');
+      }
+    };
+
+    // Initial check after 10 seconds (give connections time to establish)
+    setTimeout(pollStreamStatus, 10000);
+
+    // Then poll every 60 seconds
+    streamPollInterval = setInterval(pollStreamStatus, 60000);
+  }
+
+  private stopStreamPolling(): void {
+    if (streamPollInterval) {
+      clearInterval(streamPollInterval);
+      streamPollInterval = null;
+      log.info('Stream status polling stopped');
+    }
   }
 
   /**
@@ -245,6 +389,9 @@ class KaoticBot {
     if (timerManager) {
       timerManager.onChatMessage();
     }
+
+    // Track message for stream statistics
+    onChatMessage(accountId, message.sender.id.toString(), message.sender.username);
 
     // Determine subscriber/follower status
     const sender = message.sender as any;
@@ -798,6 +945,9 @@ class KaoticBot {
 
   async stop(): Promise<void> {
     log.info('Stopping KaoticBot...');
+
+    // Stop stream polling
+    this.stopStreamPolling();
 
     // Stop all timer managers
     for (const [accountId, manager] of timerManagers) {

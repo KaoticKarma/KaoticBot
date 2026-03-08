@@ -360,21 +360,23 @@ export async function sendOfflineNotification(
     // Build components
     const components: ActionRowBuilder<ButtonBuilder>[] = [];
     
-    if (offlineInfo.vodUrl) {
-      const row = new ActionRowBuilder<ButtonBuilder>()
-        .addComponents(
-          new ButtonBuilder()
-            .setLabel('📼 Watch VOD')
-            .setStyle(ButtonStyle.Link)
-            .setURL(offlineInfo.vodUrl)
-        );
-      components.push(row);
-    }
+    // Always show VOD button - use direct VOD URL or fall back to channel videos page
+    const vodButtonUrl = offlineInfo.vodUrl || `${offlineInfo.channelUrl}/videos`;
+    const row = new ActionRowBuilder<ButtonBuilder>()
+      .addComponents(
+        new ButtonBuilder()
+          .setLabel('📼 Watch VOD')
+          .setStyle(ButtonStyle.Link)
+          .setURL(vodButtonUrl)
+      );
+    components.push(row);
     
-    // Edit the original message
+    // Edit the original message - clear the screenshot attachment
     await originalMessage.edit({
       content: 'Stream has ended — see you next time! 👋',
       embeds: [embed],
+      files: [],
+      attachments: [],
       components: components.length > 0 ? components : [],
     });
     
@@ -422,16 +424,16 @@ async function sendNewOfflineNotification(
     
     const components: ActionRowBuilder<ButtonBuilder>[] = [];
     
-    if (offlineInfo.vodUrl) {
-      const row = new ActionRowBuilder<ButtonBuilder>()
-        .addComponents(
-          new ButtonBuilder()
-            .setLabel('📼 Watch VOD')
-            .setStyle(ButtonStyle.Link)
-            .setURL(offlineInfo.vodUrl)
-        );
-      components.push(row);
-    }
+    // Always show VOD button - use direct VOD URL or fall back to channel videos page
+    const vodButtonUrl = offlineInfo.vodUrl || `${offlineInfo.channelUrl}/videos`;
+    const vodRow = new ActionRowBuilder<ButtonBuilder>()
+      .addComponents(
+        new ButtonBuilder()
+          .setLabel('📼 Watch VOD')
+          .setStyle(ButtonStyle.Link)
+          .setURL(vodButtonUrl)
+      );
+    components.push(vodRow);
     
     await channel.send({
       content: 'Stream has ended — see you next time! 👋',
