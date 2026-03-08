@@ -70,15 +70,20 @@ class ConnectionManager {
       return null;
     }
     
-    // Check if token is expiring within 5 minutes
-    const fiveMinutesFromNow = new Date(Date.now() + 5 * 60 * 1000);
+    // Check if token is expiring within 30 minutes (refresh proactively)
+    const thirtyMinutesFromNow = new Date(Date.now() + 30 * 60 * 1000);
     
-    if (config.tokenExpiresAt <= fiveMinutesFromNow) {
-      log.info('Bot token expiring soon, refreshing...');
+    if (config.tokenExpiresAt <= thirtyMinutesFromNow) {
+      log.info('Bot token expiring within 30 minutes, refreshing...');
       const refreshed = await refreshBotToken();
       
       if (!refreshed) {
-        log.error('Failed to refresh bot token');
+        // Token refresh failed, but the current token might still be valid
+        if (config.tokenExpiresAt > new Date()) {
+          log.warn('Bot token refresh failed but token still valid — using existing token');
+          return config.accessToken;
+        }
+        log.error('Failed to refresh bot token and token is expired');
         return null;
       }
       

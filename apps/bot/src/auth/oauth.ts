@@ -888,3 +888,104 @@ export async function getAccountWithValidTokens(accountId: number): Promise<type
   
   return account;
 }
+
+// ============================================
+// Background token refresh loop
+// ============================================
+
+let tokenRefreshInterval: NodeJS.Timeout | null = null;
+
+/**
+ * Start background token refresh that runs every 30 minutes.
+ * Proactively refreshes tokens before they expire so the bot
+ * never needs manual re-authentication.
+ */
+export function startTokenRefreshLoop(): void {
+  if (tokenRefreshInterval) {
+    clearInterval(tokenRefreshInterval);
+  }
+
+  const REFRESH_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+  const TOKEN_REFRESH_BUFFER_MS = 60 * 60 * 1000; // Refresh if expiring within 1 hour
+
+  tokenRefreshInterval = setInterval(async () => {
+    const now = new Date();
+    const bufferTime = new Date(now.getTime() + TOKEN_REFRESH_BUFFER_MS);
+
+    // Refresh bot token if expiring soon
+    try {
+      const botConfig = db.select().from(schema.botConfig).get();
+      if (botConfig && botConfig.refreshToken && botConfig.tokenExpiresAt <= bufferTime) {
+        log.info('🔄 Proactive bot token refresh (expiring within 1 hour)...');
+        const success = await refreshBotToken();
+        if (success) {
+          log.info('✅ Proactive bot token refresh succeeded');
+        } else {
+          log.error('❌ Proactive bot token refresh failed — will retry in 30 minutes');
+        }
+      }
+    } catch (err) {
+      log.error({ error: String(err) }, 'Error in proactive bot token refresh');
+    }
+
+    // Refresh all account tokens if expiring soon
+    try {
+      const accounts = db.select().from(schema.accounts).all();
+      for (const account of accounts) {
+        if (account.refreshToken && account.tokenExpiresAt <= bufferTime) {
+          log.info({ accountId: account.id, username: account.kickUsername }, '🔄 Proactive account token refresh...');
+          const success = await refreshAccountTokens(account.id);
+          if (success) {
+            log.info({ accountId: account.id }, '✅ Proactive account token refresh succeeded');
+          } else {
+            log.error({ accountId: account.id }, '❌ Proactive account token refresh failed — will retry in 30 minutes');
+          }
+        }
+      }
+    } catch (err) {
+      log.error({ error: String(err) }, 'Error in proactive account token refresh');
+    }
+  }, REFRESH_INTERVAL_MS);
+
+  // Also run immediately on startup (after a short delay to let DB initialize)
+  setTimeout(async () => {
+    log.info('🔄 Running initial token refresh check on startup...');
+    const now = new Date();
+    const bufferTime = new Date(now.getTime() + TOKEN_REFRESH_BUFFER_MS);
+
+    try {
+      const botConfig = db.select().from(schema.botConfig).get();
+      if (botConfig && botConfig.refreshToken && botConfig.tokenExpiresAt <= bufferTime) {
+        log.info('Bot token expiring soon, refreshing on startup...');
+        await refreshBotToken();
+      }
+    } catch (err) {
+      log.error({ error: String(err) }, 'Startup bot token refresh error');
+    }
+
+    try {
+      const accounts = db.select().from(schema.accounts).all();
+      for (const account of accounts) {
+        if (account.refreshToken && account.tokenExpiresAt <= bufferTime) {
+          log.info({ accountId: account.id }, 'Account token expiring soon, refreshing on startup...');
+          await refreshAccountTokens(account.id);
+        }
+      }
+    } catch (err) {
+      log.error({ error: String(err) }, 'Startup account token refresh error');
+    }
+  }, 5000);
+
+  log.info('🔄 Token refresh loop started (every 30 minutes)');
+}
+
+/**
+ * Stop the background token refresh loop
+ */
+export function stopTokenRefreshLoop(): void {
+  if (tokenRefreshInterval) {
+    clearInterval(tokenRefreshInterval);
+    tokenRefreshInterval = null;
+    log.info('Token refresh loop stopped');
+  }
+}

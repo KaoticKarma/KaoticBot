@@ -13,6 +13,7 @@ import { firstTimeChatService } from './features/first-time-chat.js';
 import { queueService } from './features/queue.js';
 import { giveawayService } from './features/giveaway.js';
 import { extractBotMention, generateAIResponse, isAIEnabled } from './ai/service.js';
+import { startTokenRefreshLoop, stopTokenRefreshLoop } from './auth/oauth.js';
 import { initializeDiscordBot, shutdownDiscordBot } from './discord/service.js';
 import { onStreamLive, onStreamOffline, onChatMessage, onNewFollower, onNewSub, onGiftedSub, onViewerCountUpdate, isStreamLive } from './stats/tracker.js';
 import { createChildLogger } from './utils/logger.js';
@@ -77,6 +78,9 @@ class KaoticBot {
 
     // Reconnect all enabled bots
     await connectionManager.reconnectAll();
+
+    // Start background token refresh loop (every 30 min)
+    startTokenRefreshLoop();
 
     // Start timer managers for connected accounts
     this.startTimerManagers();
@@ -960,6 +964,9 @@ class KaoticBot {
 
     // Shutdown Discord bot
     await shutdownDiscordBot();
+
+    // Stop token refresh loop
+    stopTokenRefreshLoop();
 
     pointsService.stop();
 
